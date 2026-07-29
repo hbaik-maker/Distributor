@@ -1877,7 +1877,7 @@ async function renderReview(runId) {
       <label>냉장 <input type="number" id="cap-냉장" class="qty-input" min="0" step="0.1" placeholder="no cap"></label>
       <label>상온 <input type="number" id="cap-상온" class="qty-input" min="0" step="0.1" placeholder="no cap"></label>
       <button type="button" class="btn small" id="apply-pallet-caps">Apply pallet caps</button>
-      <span class="muted">Resets Ship qty to the suggested amount for each storage type with a cap set, then reduces lowest-priority SKUs (by 온라인 중요도, then urgency) to fit.</span>
+      <span class="muted">Resets Ship qty to the suggested amount for each storage type with a target set, then tops up (highest-priority SKUs first, by 온라인 중요도 then urgency, never beyond a SKU's own HQ stock) to reach the target, or trims lowest-priority SKUs to fit — up to half a pallet over the target is allowed either way.</span>
     </div>
     <div class="table-scroll">
       <table id="review-table">
@@ -2284,13 +2284,20 @@ function wireLiveSettings(bySku, meta, runId) {
   });
 }
 
-/* ---- Pallet-cap shaping: fit each storage type's shipment into a max
- * pallet budget for this week, prioritizing by 온라인 중요도 grade then by
- * urgency (lowest current EAST days-of-supply first). Always starts from
- * each SKU's suggested quantity, not whatever is currently in the box, so
- * re-applying with different caps is predictable rather than compounding. */
-function shapeToPalletCap(storageType, capPallets, bySku, targetDays) {
-  const maxBoxes = capPallets * BOXES_PER_PALLET;
+/* ---- Pallet-cap shaping: fit each storage type's shipment to a pallet
+ * TARGET for this week (not a hard ceiling) — ship as much as it takes to
+ * reach it, prioritizing by 온라인 중요도 grade then by urgency (lowest
+ * current EAST days-of-supply first). A half-pallet of overage is allowed
+ * in either direction: topping up to the target can overshoot it by up to
+ * half a pallet rather than stopping just short for lack of a smaller box,
+ * and trimming down to fit stops at target+0.5 pallets rather than cutting
+ * exactly at the target. Always starts from each SKU's suggested quantity,
+ * not whatever is currently in the box, so re-applying with different
+ * targets is predictable rather than compounding. */
+function shapeToPalletCap(storageType, targetPallets, bySku, targetDays) {
+  const targetBoxes = targetPallets * BOXES_PER_PALLET;
+  const overageBoxes = 0.5 * BOXES_PER_PALLET;
+  const ceilingBoxes = targetBoxes + overageBoxes;
   const rows = Array.from(document.querySelectorAll(`#review-table tbody tr[data-storage="${storageType}"]`))
     .filter((row) => row.querySelector('input[data-role="included"]').checked);
 
@@ -2299,31 +2306,62 @@ function shapeToPalletCap(storageType, capPallets, bySku, targetDays) {
     const it = bySku.get(sku);
     const eastDaysBefore = it.eastAvgDaily > 0 ? it.eastPosition / it.eastAvgDaily : Infinity;
     // GR_Few SKUs are deliberately minimized to EAST already (cheaper to
-    // ship direct from West) — they should be the first cut when fitting
-    // into a pallet budget, below even UNKNOWN-grade (rank 6) items.
+    // ship direct from West) — they should be the first cut when trimming
+    // to fit, and the last topped up when filling toward the target, below
+    // even UNKNOWN-grade (rank 6) items.
     const rank = it.grFew ? 7 : (IMPORTANCE_RANK[it.importance] ?? 6);
     return { row, it, priority: [rank, eastDaysBefore] };
   });
   withPriority.sort((a, b) => (a.priority[0] - b.priority[0]) || (a.priority[1] - b.priority[1]));
 
+  // Pass 1: same priority-order fill as before, except the boundary that
+  // trims a SKU's own suggested quantity is now the ceiling (target + 0.5
+  // pallets), not the bare target — genuine demand gets a little more room
+  // before anything is cut.
   let runningBoxes = 0;
-  withPriority.forEach(({ row, it }) => {
+  const shaped = withPriority.map(({ row, it }) => {
     const baselineQty = it.finalQtyComputed;
     let newQty = baselineQty;
     let reduced = false;
     if (it.boxSize) {
       const skuBoxes = baselineQty / it.boxSize;
-      if (runningBoxes + skuBoxes <= maxBoxes + 1e-9) {
+      if (runningBoxes + skuBoxes <= ceilingBoxes + 1e-9) {
         runningBoxes += skuBoxes;
       } else {
-        const remaining = Math.max(0, maxBoxes - runningBoxes);
+        const remaining = Math.max(0, ceilingBoxes - runningBoxes);
         newQty = round0(remaining * it.boxSize);
-        runningBoxes = maxBoxes;
+        runningBoxes = ceilingBoxes;
         reduced = newQty < baselineQty;
       }
     }
     // Rows with no box size can't be measured in pallets — leave them untouched and out of the budget.
+    return { row, it, newQty, reduced };
+  });
 
+  // Pass 2: max pallets is a target to reach, not just a ceiling — if
+  // everyone's own suggested quantity adds up to less than the target,
+  // top up whole boxes (highest priority first, round-robin so no single
+  // SKU absorbs the whole gap) until the target is hit, allowed to overshoot
+  // it by up to the same half-pallet allowance. Never ships more of a SKU
+  // than its own HQ stock actually has.
+  if (runningBoxes < targetBoxes - 1e-9) {
+    let addedAny = true;
+    while (runningBoxes < targetBoxes - 1e-9 && addedAny) {
+      addedAny = false;
+      for (const entry of shaped) {
+        if (runningBoxes >= targetBoxes - 1e-9) break;
+        if (!entry.it.boxSize) continue;
+        if (runningBoxes + 1 > ceilingBoxes + 1e-9) continue;
+        const nextQty = entry.newQty + entry.it.boxSize;
+        if (nextQty > entry.it.hqQty + 1e-9) continue;
+        entry.newQty = nextQty;
+        runningBoxes += 1;
+        addedAny = true;
+      }
+    }
+  }
+
+  shaped.forEach(({ row, it, newQty, reduced }) => {
     const qtyInput = row.querySelector('input[data-role="qty"]');
     qtyInput.value = newQty;
     qtyInput.dispatchEvent(new Event("input", { bubbles: true }));
@@ -2357,7 +2395,7 @@ function wirePalletCapControls(bySku, meta) {
       .filter((c) => Number.isFinite(c.val) && c.val >= 0);
     if (!caps.length) { alert("Enter a max pallet number for at least one storage type first."); return; }
     const label = caps.map((c) => `${c.type}: ${c.val}`).join(", ");
-    if (!confirm(`This resets Ship qty to the suggested amount for ${label}, then reduces lowest-priority SKUs to fit. Continue?`)) return;
+    if (!confirm(`This resets Ship qty to the suggested amount for ${label}, then tops up or trims to hit the target (up to 0.5 pallet over is allowed). Continue?`)) return;
     caps.forEach((c) => shapeToPalletCap(c.type, c.val, bySku, meta.settings.targetDays));
     document.getElementById("included-filter").dispatchEvent(new Event("change"));
     recomputeTotalPallets(bySku);
