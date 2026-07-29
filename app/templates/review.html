@@ -1,0 +1,160 @@
+{% extends "base.html" %}
+{% block title %}Review Run #{{ run.id }} — Wooltari Distributor{% endblock %}
+{% block content %}
+<h1>Review Run #{{ run.id }}</h1>
+<p class="subtitle">
+  Source: {{ run.source_filename }} · Uploaded {{ (run.created_at|to_pt).strftime('%Y-%m-%d %H:%M') }} PT ·
+  {{ run.items|length }} SKUs
+</p>
+
+<form method="post" action="{{ url_for('main.save_review', run_id=run.id) }}" id="review-form">
+<div class="toolbar settings-inline">
+  <strong>Settings (this run only):</strong>
+  <label>EAST cap <input type="number" id="set-cap-pct" name="live_cap_pct" class="qty-input" min="1" max="100" step="1" value="{{ '%.0f'|format(run.settings().cap_pct*100) }}"> %</label>
+  <label>EAST floor <input type="number" id="set-floor-pct" name="live_floor_pct" class="qty-input" min="0" max="99" step="1" value="{{ '%.0f'|format(run.settings().floor_pct*100) }}"> %</label>
+  <label>Target days <input type="number" id="set-target-days" name="live_target_days" class="qty-input" min="1" step="1" value="{{ run.settings().target_days }}"> days</label>
+  <label>Box round <input type="number" id="set-box-round-pct" name="live_box_round_pct" class="qty-input" min="0" max="100" step="1" value="{{ '%.0f'|format(run.settings().box_round_pct*100) }}"> %</label>
+  <label>Zero-box threshold <input type="number" id="set-zero-box-round-pct" name="live_zero_box_round_pct" class="qty-input" min="0" max="100" step="1" value="{{ '%.0f'|format(run.settings().zero_box_round_pct*100) }}"> %</label>
+  <label>Stale sale threshold <input type="number" id="set-stale-sale-days-threshold" name="live_stale_sale_days_threshold" class="qty-input" min="1" step="1" value="{{ run.settings().stale_sale_days_threshold }}"> days</label>
+  <span class="muted">Recalculates the table below immediately — does not change your saved defaults for future uploads.</span>
+  <span id="settings-inline-warning" style="color:var(--red);"></span>
+</div>
+<div class="toolbar settings-inline">
+  <strong>김치 override (this run only):</strong>
+  <label><input type="checkbox" id="set-kimchi-enabled" name="live_kimchi_enabled" {{ 'checked' if run.settings().kimchi_override_enabled else '' }}> Enable</label>
+  <label>Keyword <input type="text" id="set-kimchi-keyword" name="live_kimchi_keyword" class="qty-input" style="width:6em" value="{{ run.settings().kimchi_keyword }}"></label>
+  <label>Floor <input type="number" id="set-kimchi-floor-pct" name="live_kimchi_floor_pct" class="qty-input" min="0" max="99" step="1" value="{{ '%.0f'|format(run.settings().kimchi_floor_pct*100) }}"> %</label>
+  <label>Cap <input type="number" id="set-kimchi-cap-pct" name="live_kimchi_cap_pct" class="qty-input" min="1" max="100" step="1" value="{{ '%.0f'|format(run.settings().kimchi_cap_pct*100) }}"> %</label>
+  <label>Hard cap <input type="number" id="set-kimchi-hard-cap-pct" name="live_kimchi_hard_cap_pct" class="qty-input" min="1" max="100" step="1" value="{{ '%.0f'|format(run.settings().kimchi_hard_cap_pct*100) }}"> %</label>
+  <span class="muted">Products whose name contains the keyword always ship in whole boxes using this floor/cap band instead of the settings above.</span>
+</div>
+<div class="toolbar">
+  <div class="storage-toggle" id="storage-toggle">
+    <button type="button" class="storage-btn active" data-storage="ALL">All</button>
+    {% for s in storage_types %}<button type="button" class="storage-btn" data-storage="{{ s }}">{{ s }}</button>{% endfor %}
+  </div>
+  <input type="text" id="search-box" placeholder="Search SKU, barcode, or name...">
+  <select id="importance-filter">
+    <option value="">All 온라인 중요도</option>
+    {% for g in importance_grades %}<option value="{{ g }}">{{ '(unknown)' if g == 'UNKNOWN' else g }}</option>{% endfor %}
+  </select>
+  <select id="flag-filter">
+    <option value="">All flags</option>
+    <option value="NO_SALES_HISTORY">No sales history</option>
+    <option value="MINIMUM_FLOOR_APPLIED">Minimum floor applied</option>
+    <option value="HQ_OUT_OF_STOCK">HQ out of stock</option>
+    <option value="HQ_SHORTAGE_BELOW_MINIMUM_FLOOR">HQ shortage below floor</option>
+    <option value="EAST_UNDERSUPPLIED">East undersupplied</option>
+    <option value="WEST_UNDERSUPPLIED">West undersupplied</option>
+    <option value="PALLET_CAP_UNDERSUPPLIED">Pallet cap undersupplied</option>
+    <option value="KIMCHI_OVERRIDE">김치 override</option>
+    <option value="GR_FEW_OVERRIDE">GR_Few override</option>
+    <option value="POSSIBLY_DISCONTINUED">Possibly discontinued</option>
+  </select>
+  <select id="included-filter">
+    <option value="">Included + excluded</option>
+    <option value="yes">Included only</option>
+    <option value="no">Excluded only</option>
+  </select>
+  <div class="spacer"></div>
+  <button type="button" class="btn small secondary" id="select-visible">Select all visible</button>
+  <button type="button" class="btn small secondary" id="deselect-visible">Deselect all visible</button>
+  <span class="muted" id="visible-count"></span>
+</div>
+<div class="toolbar pallet-cap-bar">
+  <span class="muted">This week's max pallets:</span>
+  {% for s in storage_types %}<label>{{ s }} <input type="number" id="cap-{{ s }}" class="qty-input" min="0" step="0.1" placeholder="no cap"></label>{% endfor %}
+  <button type="button" class="btn small" id="apply-pallet-caps">Apply pallet caps</button>
+  <span class="muted">Resets Ship qty to the suggested amount for each storage type with a cap set, then reduces lowest-priority SKUs (by 온라인 중요도, then urgency) to fit.</span>
+</div>
+
+<div class="table-scroll">
+<table id="review-table" data-target-days="{{ run.settings().target_days }}">
+  <thead>
+    <tr>
+      <th data-col="send" draggable="true">Send?<span class="sort-indicator"></span></th>
+      <th data-col="grFew" draggable="true" title="Allocate only 0%-15% to the East. Shipping directly from the West is cheaper than the combined LTL transfer and East outbound costs.">GR_Few?<span class="sort-indicator"></span></th>
+      <th data-col="sku" draggable="true">SKU<span class="sort-indicator"></span></th>
+      <th data-col="barcode" draggable="true">Barcode<span class="sort-indicator"></span></th>
+      <th data-col="name" draggable="true">Name<span class="sort-indicator"></span></th>
+      <th data-col="importance" draggable="true">온라인 중요도<span class="sort-indicator"></span></th>
+      <th data-col="hqQty" data-sortable="true" draggable="true">HQ qty<span class="sort-indicator"></span></th>
+      <th data-col="eastPosition" data-sortable="true" draggable="true">EAST position<span class="sort-indicator"></span></th>
+      <th data-col="totalUnits" data-sortable="true" draggable="true">Total units<span class="sort-indicator"></span></th>
+      <th data-col="boxSize" data-sortable="true" draggable="true">Box size<span class="sort-indicator"></span></th>
+      <th data-col="suggestedQty" data-sortable="true" draggable="true">Suggested qty<span class="sort-indicator"></span></th>
+      <th data-col="shipQty" data-sortable="true" draggable="true">Ship qty<span class="sort-indicator"></span></th>
+      <th data-col="estBoxes" data-sortable="true" draggable="true">Est. boxes<span class="sort-indicator"></span></th>
+      <th data-col="hqDays" data-sortable="true" draggable="true">HQ days after ship<span class="sort-indicator"></span></th>
+      <th data-col="eastDays" data-sortable="true" draggable="true">EAST days after ship<span class="sort-indicator"></span></th>
+      <th data-col="flags" data-sortable="true" draggable="true">Flags<span class="sort-indicator"></span></th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for it in run.items %}
+    {% set eff = it.effective_qty() %}
+    {% set boxes = it.est_boxes() %}
+    {% set hq_days, east_days = it.days_after_ship() %}
+    <tr data-item-id="{{ it.id }}" data-importance="{{ it.importance }}" data-storage="{{ it.storage }}" data-flags="{{ it.flags()|join(' ') }}"
+        data-hq-qty="{{ it.hq_qty }}" data-east-position="{{ it.east_position }}" data-total-units="{{ it.total_units }}"
+        data-east-avg-daily="{{ it.east_avg_daily }}" data-total-avg-daily="{{ it.total_avg_daily }}" data-box-size="{{ it.box_size or '' }}"
+        data-name="{{ it.name }}"
+        data-status-online="{{ it.status_online }}" data-days-since-last-sale="{{ it.days_since_last_sale if it.days_since_last_sale is not none else '' }}"
+        data-final-qty-computed="{{ it.final_qty_computed }}"
+        data-search="{{ (it.sku ~ ' ' ~ it.barcode ~ ' ' ~ it.name)|lower }}">
+      <td data-col="send">
+        <input type="checkbox" name="included_{{ it.id }}" {{ 'checked' if it.included else '' }}>
+        <input type="hidden" id="capflag_{{ it.id }}" name="capflag_{{ it.id }}"
+               value="{{ 'PALLET_CAP_UNDERSUPPLIED' if 'PALLET_CAP_UNDERSUPPLIED' in it.flags() else '' }}">
+      </td>
+      <td data-col="grFew">
+        <input type="checkbox" class="grfew-checkbox" name="grfew_{{ it.id }}" {{ 'checked' if it.gr_few else '' }}
+               title="Allocate only 0%-15% to the East. Shipping directly from the West is cheaper than the combined LTL transfer and East outbound costs.">
+      </td>
+      <td data-col="sku">{{ it.sku }}</td>
+      <td data-col="barcode">{{ it.barcode }}</td>
+      <td data-col="name" class="truncate-cell" title="{{ it.name }}">{{ it.name }}</td>
+      <td data-col="importance"><span class="badge badge-info">{{ it.importance }}</span></td>
+      <td data-col="hqQty">{{ it.hq_qty|round|int }}</td>
+      <td data-col="eastPosition">{{ it.east_position|round|int }}</td>
+      <td data-col="totalUnits">{{ it.total_units|round|int }}</td>
+      <td data-col="boxSize">{{ it.box_size|round|int if it.box_size else '—' }}</td>
+      <td data-col="suggestedQty">{{ it.final_qty_computed }}</td>
+      <td data-col="shipQty"><input class="qty-input" type="number" min="0" step="1"
+                 name="qty_{{ it.id }}" value="{{ eff }}"></td>
+      <td data-col="estBoxes" data-role="est-boxes">{{ '%.1f'|format(boxes) if boxes is not none else '—' }}</td>
+      <td data-col="hqDays" data-role="hq-days">{{ '%.1f'|format(hq_days) if hq_days is not none else '—' }}</td>
+      <td data-col="eastDays" data-role="east-days">{{ '%.1f'|format(east_days) if east_days is not none else '—' }}</td>
+      <td data-col="flags">
+        {% for f in it.flags() %}
+          <span class="badge {{ 'badge-danger' if f in ['HQ_OUT_OF_STOCK','HQ_SHORTAGE_BELOW_MINIMUM_FLOOR','PALLET_CAP_UNDERSUPPLIED'] else 'badge-warn' }}">{{ f }}</span>
+        {% endfor %}
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+</div>
+
+{% set ns = namespace(total_boxes=0, sku_count=0) %}
+{% for it in run.items %}
+  {% if it.included %}
+    {% set ns.sku_count = ns.sku_count + 1 %}
+    {% set b = it.est_boxes() %}
+    {% if b is not none %}{% set ns.total_boxes = ns.total_boxes + b %}{% endif %}
+  {% endif %}
+{% endfor %}
+<div class="review-actions">
+  <span style="margin-right:auto;">
+    Est. total shipment: <span class="highlight-pallets" id="total-pallets-summary">{{ '%.1f'|format(ns.total_boxes) }} boxes ≈ {{ '%.2f'|format(ns.total_boxes / 50) }} pallets across {{ ns.sku_count }} SKU{{ '' if ns.sku_count == 1 else 's' }}</span>
+    <span class="muted"> · changes here only take effect once you save or finalize.</span>
+  </span>
+  <button type="submit" class="btn secondary">Save progress</button>
+  <button type="submit" class="btn" formaction="{{ url_for('main.finalize', run_id=run.id) }}"
+          onclick="return confirm('Finalize this run? It will be locked and saved to history.');">
+    Finalize run
+  </button>
+</div>
+</form>
+<script src="{{ url_for('static', filename='review.js') }}"></script>
+{% endblock %}

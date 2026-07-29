@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% block title %}History — Wooltari Distributor{% endblock %}
+{% block content %}
+<h1>Run History</h1>
+<p class="subtitle">All past runs are kept for reference only — they are never fed back into future calculations.</p>
+
+<div class="card">
+  <table>
+    <thead><tr><th>Run</th><th>Status</th><th>Uploaded</th><th>Finalized</th><th>Source file</th><th>SKUs</th><th></th></tr></thead>
+    <tbody>
+    {% for run in runs %}
+      <tr>
+        <td>#{{ run.id }}</td>
+        <td><span class="badge {{ 'badge-info' if run.status=='finalized' else 'badge-warn' }}">{{ run.status }}</span></td>
+        <td>{{ (run.created_at|to_pt).strftime('%Y-%m-%d %H:%M') }} PT</td>
+        <td>{{ (run.finalized_at|to_pt).strftime('%Y-%m-%d %H:%M') + ' PT' if run.finalized_at else '—' }}</td>
+        <td>{{ run.source_filename }}</td>
+        <td>{{ run.items|length }}</td>
+        <td><a class="btn small secondary" href="{{ url_for('main.run_detail', run_id=run.id) }}">View</a></td>
+      </tr>
+    {% else %}
+      <tr><td colspan="7" class="muted">No runs yet.</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endblock %}

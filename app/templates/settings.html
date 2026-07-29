@@ -1,0 +1,69 @@
+{% extends "base.html" %}
+{% block title %}Settings — Wooltari Distributor{% endblock %}
+{% block content %}
+<h1>Algorithm Settings</h1>
+<p class="subtitle">Changes apply to new runs only — past runs keep the settings they were calculated with.</p>
+
+<div class="card">
+  <form method="post" action="{{ url_for('main.settings_view') }}">
+    <table>
+      <tr>
+        <td>EAST cap (max % of total units EAST may hold)</td>
+        <td><input type="number" name="cap_pct" step="1" min="1" max="100" value="{{ '%.0f'|format(s.cap_pct*100) }}"> %</td>
+      </tr>
+      <tr>
+        <td>EAST minimum floor (min % of total units, stockout protection)</td>
+        <td><input type="number" name="floor_pct" step="1" min="0" max="99" value="{{ '%.0f'|format(s.floor_pct*100) }}"> %</td>
+      </tr>
+      <tr>
+        <td>Target days of EAST coverage to top up to (ships only the shortfall below this, not a flat amount on top of current stock)</td>
+        <td><input type="number" name="target_days" step="1" min="1" value="{{ s.target_days }}"> days</td>
+      </tr>
+      <tr>
+        <td>Box rounding threshold (round down to a full box if the leftover is under this % of box size, otherwise round up; each direction reverts to unrounded units if it would breach the floor/cap)</td>
+        <td><input type="number" name="box_round_pct" step="1" min="0" max="100" value="{{ '%.0f'|format(s.box_round_pct*100) }}"> %</td>
+      </tr>
+      <tr>
+        <td>Zero-box threshold (for demand below one full box, ship it anyway once it's at least this % of a box — otherwise genuine small demand gets silently rounded down to nothing)</td>
+        <td><input type="number" name="zero_box_round_pct" step="1" min="0" max="100" value="{{ '%.0f'|format(s.zero_box_round_pct*100) }}"> %</td>
+      </tr>
+    </table>
+
+    <h2>김치 (Kimchi) override</h2>
+    <p class="subtitle">Products whose name contains the keyword below use their own floor/cap band and always ship in whole boxes instead of the normal box-rounding rule.</p>
+    <table>
+      <tr>
+        <td>Enable 김치 override</td>
+        <td><input type="checkbox" name="kimchi_override_enabled" {{ 'checked' if s.kimchi_override_enabled else '' }}></td>
+      </tr>
+      <tr>
+        <td>Product name keyword</td>
+        <td><input type="text" name="kimchi_keyword" value="{{ s.kimchi_keyword }}"></td>
+      </tr>
+      <tr>
+        <td>김치 EAST minimum floor</td>
+        <td><input type="number" name="kimchi_floor_pct" step="1" min="0" max="99" value="{{ '%.0f'|format(s.kimchi_floor_pct*100) }}"> %</td>
+      </tr>
+      <tr>
+        <td>김치 EAST cap (soft — rounding up to a box may exceed this, up to the hard cap below)</td>
+        <td><input type="number" name="kimchi_cap_pct" step="1" min="1" max="100" value="{{ '%.0f'|format(s.kimchi_cap_pct*100) }}"> %</td>
+      </tr>
+      <tr>
+        <td>김치 EAST hard cap (rounding up is only allowed below this; at or above it, rounds down instead unless that would breach the floor)</td>
+        <td><input type="number" name="kimchi_hard_cap_pct" step="1" min="1" max="100" value="{{ '%.0f'|format(s.kimchi_hard_cap_pct*100) }}"> %</td>
+      </tr>
+    </table>
+
+    <h2>Possibly discontinued diagnostic</h2>
+    <p class="subtitle">Never suppresses a shipment — just flags it for manual review when the historical average is still driving a nonzero shipment despite the SKU not actually being active or recently selling.</p>
+    <table>
+      <tr>
+        <td>Stale sale threshold (flag if last actual sale was at least this many days ago)</td>
+        <td><input type="number" name="stale_sale_days_threshold" step="1" min="1" value="{{ s.stale_sale_days_threshold }}"> days</td>
+      </tr>
+    </table>
+    <br>
+    <button class="btn" type="submit">Save settings</button>
+  </form>
+</div>
+{% endblock %}

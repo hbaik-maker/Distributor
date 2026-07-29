@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+{% block title %}Run #{{ run.id }} — Wooltari Distributor{% endblock %}
+{% block content %}
+<h1>Run #{{ run.id }} <span class="badge {{ 'badge-info' if run.status=='finalized' else 'badge-warn' }}">{{ run.status }}</span></h1>
+<p class="subtitle">
+  Source: {{ run.source_filename }} · Uploaded {{ (run.created_at|to_pt).strftime('%Y-%m-%d %H:%M') }} PT
+  {% if run.finalized_at %} · Finalized {{ (run.finalized_at|to_pt).strftime('%Y-%m-%d %H:%M') }} PT{% endif %}
+</p>
+
+<div class="stat-row">
+  <div class="stat"><div class="num">{{ summary.total_skus }}</div><div class="label">Total SKUs</div></div>
+  <div class="stat"><div class="num">{{ summary.included_skus }}</div><div class="label">Included in shipment</div></div>
+  <div class="stat"><div class="num">{{ summary.total_units_to_ship }}</div><div class="label">Total units to ship</div></div>
+  <div class="stat"><div class="num">{{ summary.flagged_skus }}</div><div class="label">SKUs with flags</div></div>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0;">Downloads</h2>
+  <p class="muted">Simple = ready-to-execute pick list. Detailed = full calculation breakdown and reasoning per SKU.</p>
+  <a class="btn" href="{{ url_for('main.export_simple', run_id=run.id) }}">Download Simple Excel</a>
+  <a class="btn secondary" href="{{ url_for('main.export_detailed', run_id=run.id) }}">Download Detailed Excel</a>
+</div>
+
+{% if run.status == 'pending' %}
+<div class="card">
+  <p>This run has not been finalized yet.</p>
+  <a class="btn" href="{{ url_for('main.review', run_id=run.id) }}">Continue review</a>
+</div>
+{% endif %}
+{% endblock %}

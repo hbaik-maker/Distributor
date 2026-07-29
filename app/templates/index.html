@@ -1,0 +1,58 @@
+{% extends "base.html" %}
+{% block title %}Upload — Wooltari Distributor{% endblock %}
+{% block content %}
+<h1>West → East Distribution</h1>
+<p class="subtitle">Upload this week's "Wooltari Datasource.xlsx" export to generate a recommended shipment.</p>
+
+<div class="card">
+  <form action="{{ url_for('main.upload') }}" method="post" enctype="multipart/form-data" id="upload-form">
+    <div id="drop-zone" class="dropzone">
+      <p class="dropzone-label">Drag &amp; drop your Excel file here, or browse below.</p>
+      <input type="file" name="datasource" id="file-input" accept=".xlsx,.xlsm" required>
+      <button class="btn" type="submit">Upload &amp; Calculate</button>
+    </div>
+  </form>
+  <div id="upload-status" class="muted" style="margin-top:0.5rem;"></div>
+</div>
+<script src="{{ url_for('static', filename='upload.js') }}"></script>
+
+{% if pending %}
+<h2>Pending reviews</h2>
+<div class="card">
+  <table>
+    <thead><tr><th>Run</th><th>Uploaded</th><th>Source file</th><th>SKUs</th><th></th></tr></thead>
+    <tbody>
+    {% for run in pending %}
+      <tr>
+        <td>#{{ run.id }}</td>
+        <td>{{ (run.created_at|to_pt).strftime('%Y-%m-%d %H:%M') }} PT</td>
+        <td>{{ run.source_filename }}</td>
+        <td>{{ run.items|length }}</td>
+        <td><a class="btn small" href="{{ url_for('main.review', run_id=run.id) }}">Resume review</a></td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endif %}
+
+{% if recent %}
+<h2>Recently finalized</h2>
+<div class="card">
+  <table>
+    <thead><tr><th>Run</th><th>Finalized</th><th>Source file</th><th>SKUs</th><th></th></tr></thead>
+    <tbody>
+    {% for run in recent %}
+      <tr>
+        <td>#{{ run.id }}</td>
+        <td>{{ (run.finalized_at|to_pt).strftime('%Y-%m-%d %H:%M') + ' PT' if run.finalized_at else '' }}</td>
+        <td>{{ run.source_filename }}</td>
+        <td>{{ run.items|length }}</td>
+        <td><a class="btn small secondary" href="{{ url_for('main.run_detail', run_id=run.id) }}">View</a></td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endif %}
+{% endblock %}

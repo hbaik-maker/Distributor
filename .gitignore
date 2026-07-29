@@ -1,0 +1,18 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Local app state / secrets
+instance/
+INFRA_REFERENCE.md
+.claude/settings.local.json
+
+# Real business data (inventory, sales, supplier costs) - not for version control
+uploads/
+Sampledata/
+sample/
+simulation/
+*.xlsx
+*.xlsx:Zone.Identifier
+*:Zone.Identifier
