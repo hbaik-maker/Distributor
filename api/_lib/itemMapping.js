@@ -48,6 +48,7 @@ const FIELD_MAP = [
   ["included", "included"],
   ["finalQtyUser", "final_qty_user"],
   ["grFew", "gr_few"],
+  ["isKimchi", "is_kimchi"],
 ];
 
 function itemToRow(runId, item) {

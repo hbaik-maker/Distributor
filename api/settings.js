@@ -3,8 +3,9 @@ const { query } = require("./_lib/db");
 
 const COLS = [
   "cap_pct", "floor_pct", "target_days", "box_round_pct", "zero_box_round_pct", "no_box_min_ea", "no_box_hq_min_days",
-  "kimchi_override_enabled", "kimchi_keyword", "kimchi_floor_pct", "kimchi_cap_pct",
-  "kimchi_hard_cap_pct", "stale_sale_days_threshold", "storage_overrides_json",
+  "kimchi_override_enabled", "kimchi_floor_pct", "kimchi_cap_pct",
+  "kimchi_hard_cap_pct", "gr_few_floor_pct", "gr_few_cap_pct", "gr_few_hard_cap_pct",
+  "stale_sale_days_threshold", "storage_overrides_json",
 ];
 
 const STORAGE_TYPES = ["냉동", "냉장", "상온"];
@@ -42,10 +43,12 @@ function rowToSettings(row) {
     noBoxMinEa: row.no_box_min_ea,
     noBoxHqMinDays: row.no_box_hq_min_days,
     kimchiEnabled: row.kimchi_override_enabled,
-    kimchiKeyword: row.kimchi_keyword,
     kimchiFloorPct: row.kimchi_floor_pct,
     kimchiCapPct: row.kimchi_cap_pct,
     kimchiHardCapPct: row.kimchi_hard_cap_pct,
+    grFewFloorPct: row.gr_few_floor_pct,
+    grFewCapPct: row.gr_few_cap_pct,
+    grFewHardCapPct: row.gr_few_hard_cap_pct,
     staleSaleDaysThreshold: row.stale_sale_days_threshold,
     storageOverrides: row.storage_overrides_json || {},
   };
@@ -71,9 +74,11 @@ module.exports = async (req, res) => {
       cap_pct: s.capPct, floor_pct: s.floorPct, target_days: s.targetDays,
       box_round_pct: s.boxRoundPct, zero_box_round_pct: s.zeroBoxRoundPct, no_box_min_ea: s.noBoxMinEa,
       no_box_hq_min_days: s.noBoxHqMinDays,
-      kimchi_override_enabled: !!s.kimchiEnabled, kimchi_keyword: s.kimchiKeyword || "김치",
+      kimchi_override_enabled: !!s.kimchiEnabled,
       kimchi_floor_pct: s.kimchiFloorPct, kimchi_cap_pct: s.kimchiCapPct,
-      kimchi_hard_cap_pct: s.kimchiHardCapPct, stale_sale_days_threshold: s.staleSaleDaysThreshold,
+      kimchi_hard_cap_pct: s.kimchiHardCapPct,
+      gr_few_floor_pct: s.grFewFloorPct, gr_few_cap_pct: s.grFewCapPct, gr_few_hard_cap_pct: s.grFewHardCapPct,
+      stale_sale_days_threshold: s.staleSaleDaysThreshold,
       storage_overrides_json: JSON.stringify(sanitizeStorageOverrides(s.storageOverrides)),
     };
     if (!(values.floor_pct > 0 && values.floor_pct < values.cap_pct && values.cap_pct <= 1) || !(values.target_days > 0)) {
@@ -99,6 +104,11 @@ module.exports = async (req, res) => {
     if (!(values.kimchi_floor_pct >= 0 && values.kimchi_floor_pct < values.kimchi_cap_pct
         && values.kimchi_cap_pct < values.kimchi_hard_cap_pct && values.kimchi_hard_cap_pct <= 1)) {
       res.status(400).json({ ok: false, error: "Kimchi floor % must be less than cap %, which must be less than hard cap %, all <= 100." });
+      return;
+    }
+    if (!(values.gr_few_floor_pct >= 0 && values.gr_few_floor_pct < values.gr_few_cap_pct
+        && values.gr_few_cap_pct <= values.gr_few_hard_cap_pct && values.gr_few_hard_cap_pct <= 1)) {
+      res.status(400).json({ ok: false, error: "GR_Few floor % must be less than cap %, which must be <= hard cap %, all <= 100." });
       return;
     }
     const setClause = COLS.map((c, i) => `${c} = $${i + 1}`).join(", ");

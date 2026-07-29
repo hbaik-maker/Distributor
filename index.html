@@ -300,6 +300,7 @@ const REVIEW_COLUMNS = [
   { key: "importance", label: "온라인 중요도", sortable: false },
   { key: "send", label: "Send?", sortable: false },
   { key: "grFew", label: "GR_Few?", sortable: false, title: "Allocate only a small % to the East (see Settings > GR_Few override for the exact floor/cap). Shipping directly from the West is cheaper than the combined LTL transfer and East outbound costs." },
+  { key: "kimchi", label: "김치?", sortable: false, title: "Manually marked 김치 — uses the 김치 floor/cap band (see Settings > 김치 override) regardless of product name. Add/remove SKUs or barcodes in Settings, or toggle here for this SKU." },
   { key: "name", label: "Name / SKU / Barcode", sortable: false },
   { key: "hqQty", label: "HQ qty", sortable: true },
   { key: "eastPosition", label: "EAST position", sortable: true },
@@ -352,7 +353,7 @@ const DEFAULT_SETTINGS = {
   // runway left for the SKU (at the EAST demand rate), regardless of sales
   // history or box-rounding thresholds. See decideRounding.
   noBoxHqMinDays: 10,
-  kimchiEnabled: true, kimchiKeyword: "김치",
+  kimchiEnabled: true,
   kimchiFloorPct: 0.10, kimchiCapPct: 0.15, kimchiHardCapPct: 0.20,
   // GR_Few is a manual per-SKU override (0%-15% EAST allocation by default —
   // shipping direct from West is cheaper than the combined LTL transfer +
@@ -568,12 +569,16 @@ function decideRoundingKimchi(rawQty, boxSize, eastPosition, totalUnits, hqQty, 
 function computeShipment(item, settings) {
   settings = effectiveSettingsForStorage(settings, item.storage);
   const { targetDays, boxRoundPct, zeroBoxRoundPct, noBoxMinEa, noBoxHqMinDays } = settings;
-  const { hqQty, eastPosition, totalUnits, eastAvgDaily, totalAvgDaily, boxSize, name, grFew, statusOnline, daysSinceLastSale } = item;
+  const { hqQty, eastPosition, totalUnits, eastAvgDaily, totalAvgDaily, boxSize, grFew, statusOnline, daysSinceLastSale } = item;
   const noSalesHistory = totalAvgDaily <= 0;
 
-  const isKimchi = !!(settings.kimchiEnabled && settings.kimchiKeyword && (name || "").includes(settings.kimchiKeyword));
+  // 김치 is a manual per-SKU/barcode designation (see loadKimchiSkus) rather
+  // than a name-keyword match — not every product whose name mentions 김치
+  // actually is one, and vice versa. settings.kimchiEnabled is a kill switch
+  // that ignores the registry entirely when off.
+  const isKimchi = !!(settings.kimchiEnabled && item.isKimchi);
   // GR_Few is a manual per-SKU override and takes priority over the
-  // automatic 김치 keyword match if both apply.
+  // 김치 designation if both apply.
   let floorPct, capPct, hardCapPct;
   if (grFew) {
     floorPct = settings.grFewFloorPct; capPct = settings.grFewCapPct; hardCapPct = settings.grFewHardCapPct;
@@ -670,6 +675,7 @@ function resolveCsPerPlt(csPerPlt, boxSize, cbmEa) {
 async function computeRecommendations(boxheroRows, scmRows, settings) {
   const s = Object.assign({}, DEFAULT_SETTINGS, settings || {});
   const grFewSkus = await loadGrFewSkus();
+  const kimchiIdentifiers = await loadKimchiSkus();
 
   const scmBySku = new Map();
   let asOfDate = null;
@@ -762,6 +768,7 @@ async function computeRecommendations(boxheroRows, scmRows, settings) {
       avg5, avg30, avg90, windowUsed, totalAvgDaily, eastAvgDaily, daysSinceLastSale,
       boxSize, cost, csPerPlt, cbmEa, finalQtyUser: null,
       grFew: grFewSkus.has(sku),
+      isKimchi: kimchiIdentifiers.has(sku) || kimchiIdentifiers.has(str(row[COL_BARCODE])),
     };
     const shipment = computeShipment(item, s);
     Object.assign(item, shipment);
@@ -855,6 +862,26 @@ async function loadGrFewSkus() {
 async function syncGrFewSkus(add, remove) {
   if (!add.length && !remove.length) return;
   await apiFetch("/gr-few-skus", { method: "PUT", body: JSON.stringify({ add, remove }) });
+}
+
+/* Standing registry of SKUs/barcodes manually marked 김치 — replaces the old
+   automatic "keyword found in the product name" match, which false-positived
+   on names that merely mention 김치 without the product actually being one
+   (and missed genuine 김치 products whose name doesn't spell it out). An
+   entry here can be either a SKU or a barcode; matching checks both fields
+   on each item so either kind of input works. */
+async function loadKimchiSkus() {
+  try {
+    const data = await apiFetch("/kimchi-skus");
+    return new Set(data.identifiers);
+  } catch (e) {
+    console.error("Failed to load 김치 registry from server:", e);
+    return new Set();
+  }
+}
+async function syncKimchiSkus(add, remove) {
+  if (!add.length && !remove.length) return;
+  await apiFetch("/kimchi-skus", { method: "PUT", body: JSON.stringify({ add, remove }) });
 }
 
 async function loadMeta() {
@@ -1047,10 +1074,10 @@ function exportDetailed(meta, items) {
     // stored fields) — recompute exactly as computeRecommendations() does,
     // including this row's per-storage-type setting overrides (if any).
     const rowSettings = effectiveSettingsForStorage(s, it.storage);
-    const isKimchi = !!(rowSettings.kimchiEnabled && rowSettings.kimchiKeyword && (it.name || "").includes(rowSettings.kimchiKeyword));
+    const isKimchi = !!(rowSettings.kimchiEnabled && it.isKimchi);
     let floorPct, capPct, hardCapPct;
     if (it.grFew) {
-      floorPct = 0; capPct = 0.15; hardCapPct = 0.15;
+      floorPct = rowSettings.grFewFloorPct; capPct = rowSettings.grFewCapPct; hardCapPct = rowSettings.grFewHardCapPct;
     } else if (isKimchi) {
       floorPct = rowSettings.kimchiFloorPct; capPct = rowSettings.kimchiCapPct; hardCapPct = rowSettings.kimchiHardCapPct;
     } else {
@@ -1114,10 +1141,12 @@ function exportDetailed(meta, items) {
     ["Zero-box threshold (% of box size)", `${Math.round(s.zeroBoxRoundPct * 100)}%`],
     ...storageOverrideRows,
     ["김치 override enabled", s.kimchiEnabled ? "TRUE" : "FALSE"],
-    ["김치 keyword", s.kimchiKeyword],
     ["김치 EAST minimum floor", `${Math.round(s.kimchiFloorPct * 100)}%`],
     ["김치 EAST cap (soft)", `${Math.round(s.kimchiCapPct * 100)}%`],
     ["김치 EAST hard cap", `${Math.round(s.kimchiHardCapPct * 100)}%`],
+    ["GR_Few EAST minimum floor", `${Math.round(s.grFewFloorPct * 100)}%`],
+    ["GR_Few EAST cap (soft)", `${Math.round(s.grFewCapPct * 100)}%`],
+    ["GR_Few EAST hard cap", `${Math.round(s.grFewHardCapPct * 100)}%`],
     ["Stale sale threshold (days)", s.staleSaleDaysThreshold],
     ["Run created", fmtDate(meta.createdAt)],
     ["Run status", meta.status],
@@ -1739,6 +1768,8 @@ async function renderReview(runId) {
       <td data-col="send"><input type="checkbox" data-role="included" data-sku="${esc(it.sku)}" ${it.included ? "checked" : ""}></td>
       <td data-col="grFew"><input type="checkbox" class="grfew-checkbox" data-role="grfew" data-sku="${esc(it.sku)}" ${it.grFew ? "checked" : ""}
              title="Allocate only ${Math.round(meta.settings.grFewFloorPct * 100)}%-${Math.round(meta.settings.grFewCapPct * 100)}% to the East. Shipping directly from the West is cheaper than the combined LTL transfer and East outbound costs."></td>
+      <td data-col="kimchi"><input type="checkbox" class="kimchi-checkbox" data-role="kimchi" data-sku="${esc(it.sku)}" data-barcode="${esc(it.barcode)}" ${it.isKimchi ? "checked" : ""}
+             title="Manually marked 김치 — uses the 김치 floor/cap band regardless of product name."></td>
       <td data-col="name" class="truncate-cell" title="${esc(it.name)}">${esc(it.name)}<div class="name-sub">${esc(it.sku)} · ${esc(it.barcode)}</div></td>
       <td data-col="hqQty">${round0(it.hqQty)}</td>
       <td data-col="eastPosition">${round0(it.eastPosition)}</td>
@@ -1774,11 +1805,10 @@ async function renderReview(runId) {
     <div class="toolbar settings-inline">
       <strong>김치 override (this run only):</strong>
       <label><input type="checkbox" id="set-kimchi-enabled" ${meta.settings.kimchiEnabled ? "checked" : ""}> Enable</label>
-      <label>Keyword <input type="text" id="set-kimchi-keyword" class="qty-input" style="width:6em" value="${esc(meta.settings.kimchiKeyword)}"></label>
       <label>Floor <input type="number" id="set-kimchi-floor-pct" class="qty-input" min="0" max="99" step="1" value="${Math.round(meta.settings.kimchiFloorPct * 100)}"> %</label>
       <label>Cap <input type="number" id="set-kimchi-cap-pct" class="qty-input" min="1" max="100" step="1" value="${Math.round(meta.settings.kimchiCapPct * 100)}"> %</label>
       <label>Hard cap <input type="number" id="set-kimchi-hard-cap-pct" class="qty-input" min="1" max="100" step="1" value="${Math.round(meta.settings.kimchiHardCapPct * 100)}"> %</label>
-      <span class="muted">Products whose name contains the keyword always ship in whole boxes using this floor/cap band instead of the settings above.</span>
+      <span class="muted">SKUs/barcodes marked 김치 (Settings page, or the 김치? column below) always ship in whole boxes using this floor/cap band instead of the settings above.</span>
     </div>
     <div class="toolbar settings-inline">
       <strong>GR_Few override (this run only):</strong>
@@ -2167,7 +2197,6 @@ function wireLiveSettings(bySku, meta, runId) {
   const staleSaleDaysInput = document.getElementById("set-stale-sale-days-threshold");
   const warningEl = document.getElementById("settings-inline-warning");
   const kimchiEnabledInput = document.getElementById("set-kimchi-enabled");
-  const kimchiKeywordInput = document.getElementById("set-kimchi-keyword");
   const kimchiFloorInput = document.getElementById("set-kimchi-floor-pct");
   const kimchiCapInput = document.getElementById("set-kimchi-cap-pct");
   const kimchiHardCapInput = document.getElementById("set-kimchi-hard-cap-pct");
@@ -2185,7 +2214,6 @@ function wireLiveSettings(bySku, meta, runId) {
     const noBoxHqMinDays = parseInt(noBoxHqMinDaysInput ? noBoxHqMinDaysInput.value : NaN, 10);
     const staleSaleDaysThreshold = parseInt(staleSaleDaysInput ? staleSaleDaysInput.value : NaN, 10);
     const kimchiEnabled = !!(kimchiEnabledInput && kimchiEnabledInput.checked);
-    const kimchiKeyword = kimchiKeywordInput ? kimchiKeywordInput.value.trim() : "김치";
     const kimchiFloorPct = parseFloat(kimchiFloorInput ? kimchiFloorInput.value : NaN) / 100;
     const kimchiCapPct = parseFloat(kimchiCapInput ? kimchiCapInput.value : NaN) / 100;
     const kimchiHardCapPct = parseFloat(kimchiHardCapInput ? kimchiHardCapInput.value : NaN) / 100;
@@ -2232,23 +2260,24 @@ function wireLiveSettings(bySku, meta, runId) {
     warningEl.textContent = "";
     recomputeWithSettings(bySku, meta, runId, {
       capPct, floorPct, targetDays, boxRoundPct, zeroBoxRoundPct, noBoxMinEa, noBoxHqMinDays, staleSaleDaysThreshold,
-      kimchiEnabled, kimchiKeyword, kimchiFloorPct, kimchiCapPct, kimchiHardCapPct,
+      kimchiEnabled, kimchiFloorPct, kimchiCapPct, kimchiHardCapPct,
       grFewFloorPct, grFewCapPct, grFewHardCapPct,
       storageOverrides,
     });
   }
 
-  [capInput, floorInput, daysInput, roundInput, zeroBoxRoundInput, noBoxMinEaInput, noBoxHqMinDaysInput, staleSaleDaysInput, kimchiEnabledInput, kimchiKeywordInput, kimchiFloorInput, kimchiCapInput, kimchiHardCapInput, grFewFloorInput, grFewCapInput, grFewHardCapInput]
+  [capInput, floorInput, daysInput, roundInput, zeroBoxRoundInput, noBoxMinEaInput, noBoxHqMinDaysInput, staleSaleDaysInput, kimchiEnabledInput, kimchiFloorInput, kimchiCapInput, kimchiHardCapInput, grFewFloorInput, grFewCapInput, grFewHardCapInput]
     .filter(Boolean)
     .forEach((el) => el.addEventListener("input", apply));
   document.querySelectorAll(".storage-override-input").forEach((el) => el.addEventListener("input", apply));
 
   document.getElementById("review-table").addEventListener("change", (e) => {
-    if (e.target.dataset.role !== "grfew") return;
+    if (e.target.dataset.role !== "grfew" && e.target.dataset.role !== "kimchi") return;
     const row = e.target.closest("tr");
     const item = bySku.get(row.dataset.id);
     if (!item) return;
-    item.grFew = e.target.checked;
+    if (e.target.dataset.role === "grfew") item.grFew = e.target.checked;
+    else item.isKimchi = e.target.checked;
     applyShipmentToRow(row, item, meta.settings);
     document.getElementById("included-filter").dispatchEvent(new Event("change"));
     recomputeTotalPallets(bySku);
@@ -2343,10 +2372,17 @@ async function commitReview(runId, items, finalize) {
   const grFewRegistryBefore = await loadGrFewSkus();
   const grFewAdd = [];
   const grFewRemove = [];
+  // 김치 registry entries can be either a SKU or a barcode (see loadKimchiSkus),
+  // so "was this item already in the registry" has to check both fields, and
+  // unchecking has to remove whichever identifier(s) actually matched.
+  const kimchiRegistryBefore = await loadKimchiSkus();
+  const kimchiAdd = [];
+  const kimchiRemove = [];
   document.querySelectorAll('#review-table tbody tr').forEach((row) => {
     const checkbox = row.querySelector('input[data-role="included"]');
     const qtyInput = row.querySelector('input[data-role="qty"]');
     const grfewCheckbox = row.querySelector('input[data-role="grfew"]');
+    const kimchiCheckbox = row.querySelector('input[data-role="kimchi"]');
     const sku = checkbox.dataset.sku;
     const it = bySku.get(sku);
     if (!it) return;
@@ -2357,6 +2393,16 @@ async function commitReview(runId, items, finalize) {
       if (it.grFew && !wasInRegistry) grFewAdd.push(sku);
       else if (!it.grFew && wasInRegistry) grFewRemove.push(sku);
     }
+    if (kimchiCheckbox) {
+      it.isKimchi = kimchiCheckbox.checked;
+      const wasBySku = kimchiRegistryBefore.has(sku);
+      const wasByBarcode = !!it.barcode && kimchiRegistryBefore.has(it.barcode);
+      if (it.isKimchi && !wasBySku && !wasByBarcode) kimchiAdd.push(sku);
+      else if (!it.isKimchi) {
+        if (wasBySku) kimchiRemove.push(sku);
+        if (wasByBarcode) kimchiRemove.push(it.barcode);
+      }
+    }
     const qtyRaw = qtyInput.value.trim();
     if (qtyRaw === "") { it.finalQtyUser = null; return; }
     const qtyVal = Math.max(0, Math.round(parseFloat(qtyRaw)));
@@ -2364,6 +2410,7 @@ async function commitReview(runId, items, finalize) {
   });
   try {
     await syncGrFewSkus(grFewAdd, grFewRemove);
+    await syncKimchiSkus(kimchiAdd, kimchiRemove);
     if (finalize) {
       await finalizeRun(runId, items);
       flash("success", "Run finalized and saved to history.");
@@ -2384,6 +2431,7 @@ async function commitReview(runId, items, finalize) {
 /* ---- Settings screen ---- */
 async function renderSettings() {
   const s = await loadSettings();
+  const kimchiIdentifiers = Array.from(await loadKimchiSkus()).sort();
   app.innerHTML = layout(`
     <h1>Algorithm Settings</h1>
     <p class="subtitle">Changes apply to new runs only — past runs keep the settings they were calculated with. Shared with everyone signed in at @wooltariusa.com.</p>
@@ -2429,12 +2477,10 @@ async function renderSettings() {
       </table>
 
       <h2>김치 (Kimchi) override</h2>
-      <p class="subtitle">Products whose name contains the keyword below use their own floor/cap band and always ship in whole boxes instead of the normal box-rounding rule.</p>
+      <p class="subtitle">SKUs or barcodes explicitly marked below always ship in whole boxes using their own floor/cap band — not every product whose name mentions 김치 is actually one (and some genuine 김치 products don't spell it out), so this is a manual list rather than a name match.</p>
       <table>
         <tr><td>Enable 김치 override</td>
             <td><input type="checkbox" id="kimchi_override_enabled" ${s.kimchiEnabled ? "checked" : ""}></td></tr>
-        <tr><td>Product name keyword</td>
-            <td><input type="text" id="kimchi_keyword" value="${esc(s.kimchiKeyword)}"></td></tr>
         <tr><td>김치 EAST minimum floor</td>
             <td><input type="number" id="kimchi_floor_pct" step="1" min="0" max="99" value="${Math.round(s.kimchiFloorPct * 100)}"> %</td></tr>
         <tr><td>김치 EAST cap (soft — rounding up to a box may exceed this, up to the hard cap below)</td>
@@ -2442,6 +2488,16 @@ async function renderSettings() {
         <tr><td>김치 EAST hard cap (rounding up is only allowed below this; at or above it, rounds down instead unless that would breach the floor)</td>
             <td><input type="number" id="kimchi_hard_cap_pct" step="1" min="1" max="100" value="${Math.round(s.kimchiHardCapPct * 100)}"> %</td></tr>
       </table>
+      <p class="subtitle" style="margin-top:1rem;">Mark a SKU or barcode as 김치 — saved immediately, independent of the "Save settings" button below:</p>
+      <div class="toolbar" style="margin-bottom:0.5rem;">
+        <input type="text" id="kimchi-add-input" placeholder="SKU or barcode" style="width:14em;">
+        <button type="button" class="btn small" id="kimchi-add-btn">Add</button>
+      </div>
+      <div id="kimchi-list">
+        ${kimchiIdentifiers.length
+          ? kimchiIdentifiers.map((id) => `<span class="badge badge-info" style="margin:0.15rem;">${esc(id)} <a href="#" class="kimchi-remove" data-id="${esc(id)}" title="Remove" style="color:inherit;text-decoration:none;font-weight:700;">&times;</a></span>`).join("")
+          : '<span class="muted">No SKUs/barcodes marked 김치 yet.</span>'}
+      </div>
 
       <h2>GR_Few override</h2>
       <p class="subtitle">SKUs checked GR_Few on the review page always ship in whole boxes using this floor/cap band instead of the settings above — shipping direct from the West is cheaper than the combined LTL transfer and East outbound costs, so only a small share is allocated to the East.</p>
@@ -2473,7 +2529,6 @@ async function renderSettings() {
     const noBoxMinEa = parseInt(document.getElementById("no_box_min_ea").value, 10);
     const noBoxHqMinDays = parseInt(document.getElementById("no_box_hq_min_days").value, 10);
     const kimchiEnabled = document.getElementById("kimchi_override_enabled").checked;
-    const kimchiKeyword = document.getElementById("kimchi_keyword").value.trim() || "김치";
     const kimchiFloorPct = parseFloat(document.getElementById("kimchi_floor_pct").value) / 100;
     const kimchiCapPct = parseFloat(document.getElementById("kimchi_cap_pct").value) / 100;
     const kimchiHardCapPct = parseFloat(document.getElementById("kimchi_hard_cap_pct").value) / 100;
@@ -2528,7 +2583,7 @@ async function renderSettings() {
       try {
         await saveSettings({
           capPct, floorPct, targetDays, boxRoundPct, zeroBoxRoundPct, noBoxMinEa, noBoxHqMinDays, staleSaleDaysThreshold,
-          kimchiEnabled, kimchiKeyword, kimchiFloorPct, kimchiCapPct, kimchiHardCapPct,
+          kimchiEnabled, kimchiFloorPct, kimchiCapPct, kimchiHardCapPct,
           grFewFloorPct, grFewCapPct, grFewHardCapPct,
           storageOverrides,
         });
@@ -2538,6 +2593,35 @@ async function renderSettings() {
       }
     }
     renderSettings();
+  });
+
+  document.getElementById("kimchi-add-btn").addEventListener("click", async () => {
+    const input = document.getElementById("kimchi-add-input");
+    const val = input.value.trim();
+    if (!val) return;
+    try {
+      await syncKimchiSkus([val], []);
+      flash("success", `Added "${val}" as 김치.`);
+      renderSettings();
+    } catch (e) {
+      flash("error", "Could not add: " + e.message);
+    }
+  });
+  document.getElementById("kimchi-add-input").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") document.getElementById("kimchi-add-btn").click();
+  });
+  document.querySelectorAll(".kimchi-remove").forEach((el) => {
+    el.addEventListener("click", async (e) => {
+      e.preventDefault();
+      const id = el.dataset.id;
+      try {
+        await syncKimchiSkus([], [id]);
+        flash("success", `Removed "${id}" from 김치.`);
+        renderSettings();
+      } catch (e2) {
+        flash("error", "Could not remove: " + e2.message);
+      }
+    });
   });
 }
 
