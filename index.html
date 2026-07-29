@@ -852,7 +852,7 @@ async function saveSettings(s) {
    forward to future runs. */
 async function loadGrFewSkus() {
   try {
-    const data = await apiFetch("/gr-few-skus");
+    const data = await apiFetch("/registries/gr-few");
     return new Set(data.skus);
   } catch (e) {
     console.error("Failed to load GR_Few registry from server:", e);
@@ -861,7 +861,7 @@ async function loadGrFewSkus() {
 }
 async function syncGrFewSkus(add, remove) {
   if (!add.length && !remove.length) return;
-  await apiFetch("/gr-few-skus", { method: "PUT", body: JSON.stringify({ add, remove }) });
+  await apiFetch("/registries/gr-few", { method: "PUT", body: JSON.stringify({ add, remove }) });
 }
 
 /* Standing registry of SKUs/barcodes manually marked 김치 — replaces the old
@@ -872,7 +872,7 @@ async function syncGrFewSkus(add, remove) {
    on each item so either kind of input works. */
 async function loadKimchiSkus() {
   try {
-    const data = await apiFetch("/kimchi-skus");
+    const data = await apiFetch("/registries/kimchi");
     return new Set(data.identifiers);
   } catch (e) {
     console.error("Failed to load 김치 registry from server:", e);
@@ -881,7 +881,7 @@ async function loadKimchiSkus() {
 }
 async function syncKimchiSkus(add, remove) {
   if (!add.length && !remove.length) return;
-  await apiFetch("/kimchi-skus", { method: "PUT", body: JSON.stringify({ add, remove }) });
+  await apiFetch("/registries/kimchi", { method: "PUT", body: JSON.stringify({ add, remove }) });
 }
 
 async function loadMeta() {
