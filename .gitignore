@@ -3,6 +3,12 @@
 __pycache__/
 *.pyc
 
+# Node (api/ backend)
+node_modules/
+.vercel/
+.env
+.env.local
+
 # Local app state / secrets
 instance/
 INFRA_REFERENCE.md
