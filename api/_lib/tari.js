@@ -144,7 +144,7 @@ function buildBoxheroRow(legacy, item) {
     Category: (item && item.category_name) || "",
     "입수/박스": (item && num(item.units_per_case) > 0) ? item.units_per_case : num(legacy.units_per_case),
     "Status.Online": (legacy.sales_status_online || (item && item.status) || ""),
-    "온라인 중요도": (item && item.sales_grade) || "",
+    "온라인 중요도": (item && item.md_grade) || "",
     "보관": STORAGE_CONDITION_KO[storageRaw] || "",
     "Qty(00_HQ_Online)": num(legacy.stock_hq_west_online),
     "Qty(10_LOCAL_TRANS_ONLINE)": num(legacy.stock_lc_west_online),
