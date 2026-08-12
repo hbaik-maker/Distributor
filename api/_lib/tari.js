@@ -148,7 +148,10 @@ function buildBoxheroRow(legacy, item) {
     "보관": STORAGE_CONDITION_KO[storageRaw] || "",
     "Qty(00_HQ_Online)": num(legacy.stock_hq_west_online),
     "Qty(10_LOCAL_TRANS_ONLINE)": num(legacy.stock_lc_west_online),
-    "Qty(10_KPAC_Online)": num(legacy.stock_kpac_west_online) + num(legacy.stock_kpac_west_b2b),
+    // B2B stock (stock_*_b2b) is deliberately excluded everywhere in this
+    // mapping -- it's committed/reserved for wholesale customers, not
+    // available to ship to EAST for online demand.
+    "Qty(10_KPAC_Online)": num(legacy.stock_kpac_west_online),
     // Folded into Qty(10_PA_ONLINE) below — Tari has no separate ART field
     // anywhere (legacy-stocks or WMS-native inventory); confirmed via
     // correlation that stock_main_east_online already includes it.
