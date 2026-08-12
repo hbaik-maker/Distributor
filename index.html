@@ -300,7 +300,7 @@ const REVIEW_COLUMNS = [
   { key: "importance", label: "온라인 중요도", sortable: false },
   { key: "send", label: "Send?", sortable: false },
   { key: "grFew", label: "GR_Few?", sortable: false, title: "Allocate only a small % to the East (see Settings > GR_Few override for the exact floor/cap). Shipping directly from the West is cheaper than the combined LTL transfer and East outbound costs." },
-  { key: "kimchi", label: "김치?", sortable: false, title: "Manually marked 김치 — uses the 김치 floor/cap band (see Settings > 김치 override) regardless of product name. Add/remove SKUs or barcodes in Settings, or toggle here for this SKU." },
+  { key: "kimchi", label: "김치?", sortable: false, title: "Manually marked 김치 — never shipped to EAST, regardless of demand or HQ stock. Add/remove SKUs or barcodes in Settings, or toggle here for this SKU." },
   { key: "name", label: "Name / SKU / Barcode", sortable: false },
   { key: "hqQty", label: "HQ qty", sortable: true },
   { key: "eastPosition", label: "EAST position", sortable: true },
@@ -354,11 +354,9 @@ const DEFAULT_SETTINGS = {
   // history or box-rounding thresholds. See decideRounding.
   noBoxHqMinDays: 10,
   kimchiEnabled: true,
-  kimchiFloorPct: 0.10, kimchiCapPct: 0.15, kimchiHardCapPct: 0.20,
   // GR_Few is a manual per-SKU override (0%-15% EAST allocation by default —
   // shipping direct from West is cheaper than the combined LTL transfer +
-  // East outbound costs). Same floor/cap/hard-cap shape as 김치 above, just
-  // configurable instead of hardcoded.
+  // East outbound costs).
   grFewFloorPct: 0.0, grFewCapPct: 0.15, grFewHardCapPct: 0.15,
   // Per-storage-type overrides (냉동/냉장/상온), e.g. { 상온: { floorPct: 0.10 } }.
   // Only the keys present for a given storage type override the base
@@ -534,13 +532,15 @@ function decideRounding(rawQty, boxSize, eastPosition, totalUnits, capPct, boxRo
   return { finalQty: roundedUp, roundingNote: `rounded up to ${roundedUp / boxSize} box(es) of ${boxSize}` };
 }
 
-/* Kimchi products always ship in whole boxes, rounding UP by default
+/* GR_Few products always ship in whole boxes, rounding UP by default
    instead of the 30%-remainder rule. Rounding up past capPct is kept as
    long as it stays under hardCapPct; at/beyond hardCapPct it rounds down
    instead, unless that would breach floorPct, in which case it reverts to
-   rounding up regardless (floor protection wins). */
-function decideRoundingKimchi(rawQty, boxSize, eastPosition, totalUnits, hqQty, floorPct, capPct, hardCapPct) {
-  if (rawQty <= 1e-9) return { finalQty: 0, roundingNote: "김치: no shipment needed" };
+   rounding up regardless (floor protection wins). Formerly shared with 김치
+   (hence the name) before 김치 became an always-zero standing override
+   instead of its own floor/cap band — now GR_Few-only. */
+function decideRoundingGrFew(rawQty, boxSize, eastPosition, totalUnits, hqQty, floorPct, capPct, hardCapPct) {
+  if (rawQty <= 1e-9) return { finalQty: 0, roundingNote: "GR_Few: no shipment needed" };
   const wholeBoxes = Math.floor(rawQty / boxSize);
   const maxBoxesFromHq = hqQty > 0 ? Math.floor(hqQty / boxSize) : 0;
   const roundedUp = Math.min(wholeBoxes + 1, maxBoxesFromHq) * boxSize;
@@ -548,16 +548,16 @@ function decideRoundingKimchi(rawQty, boxSize, eastPosition, totalUnits, hqQty, 
 
   const upShare = totalUnits ? (eastPosition + roundedUp) / totalUnits : 0;
   if (upShare < capPct - 1e-9) {
-    return { finalQty: roundedUp, roundingNote: `김치: rounded up to ${roundedUp / boxSize} box(es) of ${boxSize} (within ${Math.round(capPct * 100)}% cap)` };
+    return { finalQty: roundedUp, roundingNote: `GR_Few: rounded up to ${roundedUp / boxSize} box(es) of ${boxSize} (within ${Math.round(capPct * 100)}% cap)` };
   }
   if (upShare < hardCapPct - 1e-9) {
-    return { finalQty: roundedUp, roundingNote: `김치: rounded up to ${roundedUp / boxSize} box(es) — over ${Math.round(capPct * 100)}% cap but under ${Math.round(hardCapPct * 100)}%, kept` };
+    return { finalQty: roundedUp, roundingNote: `GR_Few: rounded up to ${roundedUp / boxSize} box(es) — over ${Math.round(capPct * 100)}% cap but under ${Math.round(hardCapPct * 100)}%, kept` };
   }
   const downShare = totalUnits ? (eastPosition + roundedDown) / totalUnits : 0;
   if (downShare < floorPct - 1e-9) {
-    return { finalQty: roundedUp, roundingNote: `김치: rounding down would breach the ${Math.round(floorPct * 100)}% floor — kept rounded up at ${roundedUp / boxSize} box(es)` };
+    return { finalQty: roundedUp, roundingNote: `GR_Few: rounding down would breach the ${Math.round(floorPct * 100)}% floor — kept rounded up at ${roundedUp / boxSize} box(es)` };
   }
-  return { finalQty: roundedDown, roundingNote: `김치: rounded up hit ${Math.round(upShare * 100)}% (≥${Math.round(hardCapPct * 100)}%) — rounded down to ${roundedDown / boxSize} box(es)` };
+  return { finalQty: roundedDown, roundingNote: `GR_Few: rounded up hit ${Math.round(upShare * 100)}% (≥${Math.round(hardCapPct * 100)}%) — rounded down to ${roundedDown / boxSize} box(es)` };
 }
 
 /* The settings-dependent half of the algorithm — everything from here down
@@ -572,18 +572,22 @@ function computeShipment(item, settings) {
   const { hqQty, eastPosition, totalUnits, eastAvgDaily, totalAvgDaily, boxSize, grFew, statusOnline, daysSinceLastSale } = item;
   const noSalesHistory = totalAvgDaily <= 0;
 
-  // 김치 is a manual per-SKU/barcode designation (see loadKimchiSkus) rather
-  // than a name-keyword match — not every product whose name mentions 김치
-  // actually is one, and vice versa. settings.kimchiEnabled is a kill switch
-  // that ignores the registry entirely when off.
+  // 김치 is a manual per-SKU/barcode standing override (see loadKimchiSkus)
+  // — not a different floor/cap band, a flat "never ship this to EAST"
+  // regardless of demand, HQ stock, or anything else. settings.kimchiEnabled
+  // is a kill switch that ignores the registry entirely when off.
   const isKimchi = !!(settings.kimchiEnabled && item.isKimchi);
-  // GR_Few is a manual per-SKU override and takes priority over the
-  // 김치 designation if both apply.
+  if (isKimchi) {
+    return {
+      desiredQty: 0, minFloorQty: 0, targetQty: 0, capRoom: 0, rawQty: 0, bindingConstraint: "DEMAND",
+      roundingNote: "김치 — standing override, never shipped to EAST",
+      finalQtyComputed: 0, flags: ["KIMCHI_OVERRIDE"], includedDefault: false,
+    };
+  }
+
   let floorPct, capPct, hardCapPct;
   if (grFew) {
     floorPct = settings.grFewFloorPct; capPct = settings.grFewCapPct; hardCapPct = settings.grFewHardCapPct;
-  } else if (isKimchi) {
-    floorPct = settings.kimchiFloorPct; capPct = settings.kimchiCapPct; hardCapPct = settings.kimchiHardCapPct;
   } else {
     floorPct = settings.floorPct; capPct = settings.capPct;
   }
@@ -601,8 +605,8 @@ function computeShipment(item, settings) {
   const binding = bindingConstraint(targetQty, capRoom, hqQty, desiredQty, minFloorQty);
 
   let finalQty, roundingNote;
-  if (boxSize && (grFew || isKimchi)) {
-    ({ finalQty, roundingNote } = decideRoundingKimchi(rawQty, boxSize, eastPosition, totalUnits, hqQty, floorPct, capPct, hardCapPct));
+  if (boxSize && grFew) {
+    ({ finalQty, roundingNote } = decideRoundingGrFew(rawQty, boxSize, eastPosition, totalUnits, hqQty, floorPct, capPct, hardCapPct));
   } else if (boxSize) {
     ({ finalQty, roundingNote } = decideRounding(rawQty, boxSize, eastPosition, totalUnits, capPct, boxRoundPct, zeroBoxRoundPct, noBoxMinEa, !noSalesHistory, hqQty, eastAvgDaily, noBoxHqMinDays));
   } else {
@@ -613,7 +617,6 @@ function computeShipment(item, settings) {
 
   const flags = [];
   if (grFew) flags.push("GR_FEW_OVERRIDE");
-  else if (isKimchi) flags.push("KIMCHI_OVERRIDE");
   if (noSalesHistory) flags.push("NO_SALES_HISTORY");
   if (finalQty > 0) {
     const isActiveStatus = String(statusOnline || "").trim().toLowerCase() === "active";
@@ -621,7 +624,7 @@ function computeShipment(item, settings) {
     if (!isActiveStatus || isStaleSale) flags.push("POSSIBLY_DISCONTINUED");
   }
   if (minFloorQty > desiredQty + 1e-9) flags.push("MINIMUM_FLOOR_APPLIED");
-  if (finalQty === 0 && rawQty > 0 && boxSize && !(grFew || isKimchi) && rawQty < boxSize) flags.push("SMALL_QTY_SKIPPED");
+  if (finalQty === 0 && rawQty > 0 && boxSize && !grFew && rawQty < boxSize) flags.push("SMALL_QTY_SKIPPED");
   if (hqQty <= 0) flags.push("HQ_OUT_OF_STOCK");
   else if (binding === "HQ_STOCK" && hqQty < minFloorQty - 1e-9) flags.push("HQ_SHORTAGE_BELOW_MINIMUM_FLOOR");
   if (eastAvgDaily > 0) {
@@ -1075,25 +1078,30 @@ function exportDetailed(meta, items) {
     // including this row's per-storage-type setting overrides (if any).
     const rowSettings = effectiveSettingsForStorage(s, it.storage);
     const isKimchi = !!(rowSettings.kimchiEnabled && it.isKimchi);
-    let floorPct, capPct, hardCapPct;
-    if (it.grFew) {
-      floorPct = rowSettings.grFewFloorPct; capPct = rowSettings.grFewCapPct; hardCapPct = rowSettings.grFewHardCapPct;
-    } else if (isKimchi) {
-      floorPct = rowSettings.kimchiFloorPct; capPct = rowSettings.kimchiCapPct; hardCapPct = rowSettings.kimchiHardCapPct;
+    let desiredQty, minFloorQty, targetQty, capRoom, rawQty, bindingConstraintVal, roundingNote;
+    if (isKimchi) {
+      desiredQty = minFloorQty = targetQty = capRoom = rawQty = 0;
+      bindingConstraintVal = "DEMAND";
+      roundingNote = "김치 — standing override, never shipped to EAST";
     } else {
-      floorPct = rowSettings.floorPct; capPct = rowSettings.capPct;
+      let floorPct, capPct, hardCapPct;
+      if (it.grFew) {
+        floorPct = rowSettings.grFewFloorPct; capPct = rowSettings.grFewCapPct; hardCapPct = rowSettings.grFewHardCapPct;
+      } else {
+        floorPct = rowSettings.floorPct; capPct = rowSettings.capPct;
+      }
+      desiredQty = Math.max(0, rowSettings.targetDays * it.eastAvgDaily - it.eastPosition);
+      minFloorQty = Math.max(0, floorPct * it.totalUnits - it.eastPosition);
+      targetQty = Math.max(desiredQty, minFloorQty);
+      capRoom = capPct * it.totalUnits - it.eastPosition;
+      rawQty = Math.max(0, Math.min(targetQty, capRoom, it.hqQty));
+      bindingConstraintVal = bindingConstraint(targetQty, capRoom, it.hqQty, desiredQty, minFloorQty);
+      roundingNote = it.boxSize
+        ? (it.grFew
+            ? decideRoundingGrFew(rawQty, it.boxSize, it.eastPosition, it.totalUnits, it.hqQty, floorPct, capPct, hardCapPct).roundingNote
+            : decideRounding(rawQty, it.boxSize, it.eastPosition, it.totalUnits, capPct, rowSettings.boxRoundPct, rowSettings.zeroBoxRoundPct, rowSettings.noBoxMinEa, it.totalAvgDaily > 0, it.hqQty, it.eastAvgDaily, rowSettings.noBoxHqMinDays).roundingNote)
+        : "no box size on file — units only";
     }
-    const desiredQty = Math.max(0, rowSettings.targetDays * it.eastAvgDaily - it.eastPosition);
-    const minFloorQty = Math.max(0, floorPct * it.totalUnits - it.eastPosition);
-    const targetQty = Math.max(desiredQty, minFloorQty);
-    const capRoom = capPct * it.totalUnits - it.eastPosition;
-    const rawQty = Math.max(0, Math.min(targetQty, capRoom, it.hqQty));
-    const bindingConstraintVal = bindingConstraint(targetQty, capRoom, it.hqQty, desiredQty, minFloorQty);
-    const roundingNote = it.boxSize
-      ? ((it.grFew || isKimchi)
-          ? decideRoundingKimchi(rawQty, it.boxSize, it.eastPosition, it.totalUnits, it.hqQty, floorPct, capPct, hardCapPct).roundingNote
-          : decideRounding(rawQty, it.boxSize, it.eastPosition, it.totalUnits, capPct, rowSettings.boxRoundPct, rowSettings.zeroBoxRoundPct, rowSettings.noBoxMinEa, it.totalAvgDaily > 0, it.hqQty, it.eastAvgDaily, rowSettings.noBoxHqMinDays).roundingNote)
-      : "no box size on file — units only";
     if (it.included) {
       if (boxes !== null) totalBoxesIncluded += boxes;
       totalKpacBoxes += kpacBoxes;
@@ -1140,10 +1148,7 @@ function exportDetailed(meta, items) {
     ["Box rounding threshold (% of box size)", `${Math.round(s.boxRoundPct * 100)}%`],
     ["Zero-box threshold (% of box size)", `${Math.round(s.zeroBoxRoundPct * 100)}%`],
     ...storageOverrideRows,
-    ["김치 override enabled", s.kimchiEnabled ? "TRUE" : "FALSE"],
-    ["김치 EAST minimum floor", `${Math.round(s.kimchiFloorPct * 100)}%`],
-    ["김치 EAST cap (soft)", `${Math.round(s.kimchiCapPct * 100)}%`],
-    ["김치 EAST hard cap", `${Math.round(s.kimchiHardCapPct * 100)}%`],
+    ["김치 override enabled (never shipped to EAST when on)", s.kimchiEnabled ? "TRUE" : "FALSE"],
     ["GR_Few EAST minimum floor", `${Math.round(s.grFewFloorPct * 100)}%`],
     ["GR_Few EAST cap (soft)", `${Math.round(s.grFewCapPct * 100)}%`],
     ["GR_Few EAST hard cap", `${Math.round(s.grFewHardCapPct * 100)}%`],
@@ -1769,7 +1774,7 @@ async function renderReview(runId) {
       <td data-col="grFew"><input type="checkbox" class="grfew-checkbox" data-role="grfew" data-sku="${esc(it.sku)}" ${it.grFew ? "checked" : ""}
              title="Allocate only ${Math.round(meta.settings.grFewFloorPct * 100)}%-${Math.round(meta.settings.grFewCapPct * 100)}% to the East. Shipping directly from the West is cheaper than the combined LTL transfer and East outbound costs."></td>
       <td data-col="kimchi"><input type="checkbox" class="kimchi-checkbox" data-role="kimchi" data-sku="${esc(it.sku)}" data-barcode="${esc(it.barcode)}" ${it.isKimchi ? "checked" : ""}
-             title="Manually marked 김치 — uses the 김치 floor/cap band regardless of product name."></td>
+             title="Manually marked 김치 — never shipped to EAST, regardless of demand or HQ stock."></td>
       <td data-col="name" class="truncate-cell" title="${esc(it.name)}">${esc(it.name)}<div class="name-sub">${esc(it.sku)} · ${esc(it.barcode)}</div></td>
       <td data-col="hqQty">${round0(it.hqQty)}</td>
       <td data-col="eastPosition">${round0(it.eastPosition)}</td>
@@ -1805,10 +1810,7 @@ async function renderReview(runId) {
     <div class="toolbar settings-inline">
       <strong>김치 override (this run only):</strong>
       <label><input type="checkbox" id="set-kimchi-enabled" ${meta.settings.kimchiEnabled ? "checked" : ""}> Enable</label>
-      <label>Floor <input type="number" id="set-kimchi-floor-pct" class="qty-input" min="0" max="99" step="1" value="${Math.round(meta.settings.kimchiFloorPct * 100)}"> %</label>
-      <label>Cap <input type="number" id="set-kimchi-cap-pct" class="qty-input" min="1" max="100" step="1" value="${Math.round(meta.settings.kimchiCapPct * 100)}"> %</label>
-      <label>Hard cap <input type="number" id="set-kimchi-hard-cap-pct" class="qty-input" min="1" max="100" step="1" value="${Math.round(meta.settings.kimchiHardCapPct * 100)}"> %</label>
-      <span class="muted">SKUs/barcodes marked 김치 (Settings page, or the 김치? column below) always ship in whole boxes using this floor/cap band instead of the settings above.</span>
+      <span class="muted">SKUs/barcodes marked 김치 (Settings page, or the 김치? column below) are never shipped to EAST, regardless of demand or HQ stock.</span>
     </div>
     <div class="toolbar settings-inline">
       <strong>GR_Few override (this run only):</strong>
@@ -2197,9 +2199,6 @@ function wireLiveSettings(bySku, meta, runId) {
   const staleSaleDaysInput = document.getElementById("set-stale-sale-days-threshold");
   const warningEl = document.getElementById("settings-inline-warning");
   const kimchiEnabledInput = document.getElementById("set-kimchi-enabled");
-  const kimchiFloorInput = document.getElementById("set-kimchi-floor-pct");
-  const kimchiCapInput = document.getElementById("set-kimchi-cap-pct");
-  const kimchiHardCapInput = document.getElementById("set-kimchi-hard-cap-pct");
   const grFewFloorInput = document.getElementById("set-gr-few-floor-pct");
   const grFewCapInput = document.getElementById("set-gr-few-cap-pct");
   const grFewHardCapInput = document.getElementById("set-gr-few-hard-cap-pct");
@@ -2214,9 +2213,6 @@ function wireLiveSettings(bySku, meta, runId) {
     const noBoxHqMinDays = parseInt(noBoxHqMinDaysInput ? noBoxHqMinDaysInput.value : NaN, 10);
     const staleSaleDaysThreshold = parseInt(staleSaleDaysInput ? staleSaleDaysInput.value : NaN, 10);
     const kimchiEnabled = !!(kimchiEnabledInput && kimchiEnabledInput.checked);
-    const kimchiFloorPct = parseFloat(kimchiFloorInput ? kimchiFloorInput.value : NaN) / 100;
-    const kimchiCapPct = parseFloat(kimchiCapInput ? kimchiCapInput.value : NaN) / 100;
-    const kimchiHardCapPct = parseFloat(kimchiHardCapInput ? kimchiHardCapInput.value : NaN) / 100;
     const grFewFloorPct = parseFloat(grFewFloorInput ? grFewFloorInput.value : NaN) / 100;
     const grFewCapPct = parseFloat(grFewCapInput ? grFewCapInput.value : NaN) / 100;
     const grFewHardCapPct = parseFloat(grFewHardCapInput ? grFewHardCapInput.value : NaN) / 100;
@@ -2228,14 +2224,11 @@ function wireLiveSettings(bySku, meta, runId) {
       && Number.isFinite(noBoxMinEa) && noBoxMinEa >= 0
       && Number.isFinite(noBoxHqMinDays) && noBoxHqMinDays >= 0
       && Number.isFinite(staleSaleDaysThreshold) && staleSaleDaysThreshold >= 1
-      && Number.isFinite(kimchiFloorPct) && kimchiFloorPct >= 0
-      && Number.isFinite(kimchiCapPct) && kimchiFloorPct < kimchiCapPct
-      && Number.isFinite(kimchiHardCapPct) && kimchiCapPct < kimchiHardCapPct && kimchiHardCapPct <= 1
       && Number.isFinite(grFewFloorPct) && grFewFloorPct >= 0
       && Number.isFinite(grFewCapPct) && grFewFloorPct < grFewCapPct
       && Number.isFinite(grFewHardCapPct) && grFewCapPct <= grFewHardCapPct && grFewHardCapPct <= 1;
     if (!valid) {
-      warningEl.textContent = "Floor % must be less than Cap %, Cap % must be 1-100, target days must be positive, zero-box threshold must be between 0 and the box rounding threshold, min EA and min HQ days must be 0 or more, stale sale threshold must be at least 1 day, 김치 floor < cap < hard cap, and GR_Few floor < cap <= hard cap.";
+      warningEl.textContent = "Floor % must be less than Cap %, Cap % must be 1-100, target days must be positive, zero-box threshold must be between 0 and the box rounding threshold, min EA and min HQ days must be 0 or more, stale sale threshold must be at least 1 day, and GR_Few floor < cap <= hard cap.";
       return;
     }
     const storageOverrides = {};
@@ -2260,13 +2253,13 @@ function wireLiveSettings(bySku, meta, runId) {
     warningEl.textContent = "";
     recomputeWithSettings(bySku, meta, runId, {
       capPct, floorPct, targetDays, boxRoundPct, zeroBoxRoundPct, noBoxMinEa, noBoxHqMinDays, staleSaleDaysThreshold,
-      kimchiEnabled, kimchiFloorPct, kimchiCapPct, kimchiHardCapPct,
+      kimchiEnabled,
       grFewFloorPct, grFewCapPct, grFewHardCapPct,
       storageOverrides,
     });
   }
 
-  [capInput, floorInput, daysInput, roundInput, zeroBoxRoundInput, noBoxMinEaInput, noBoxHqMinDaysInput, staleSaleDaysInput, kimchiEnabledInput, kimchiFloorInput, kimchiCapInput, kimchiHardCapInput, grFewFloorInput, grFewCapInput, grFewHardCapInput]
+  [capInput, floorInput, daysInput, roundInput, zeroBoxRoundInput, noBoxMinEaInput, noBoxHqMinDaysInput, staleSaleDaysInput, kimchiEnabledInput, grFewFloorInput, grFewCapInput, grFewHardCapInput]
     .filter(Boolean)
     .forEach((el) => el.addEventListener("input", apply));
   document.querySelectorAll(".storage-override-input").forEach((el) => el.addEventListener("input", apply));
@@ -2515,18 +2508,12 @@ async function renderSettings() {
       </table>
 
       <h2>김치 (Kimchi) override</h2>
-      <p class="subtitle">SKUs or barcodes explicitly marked below always ship in whole boxes using their own floor/cap band — not every product whose name mentions 김치 is actually one (and some genuine 김치 products don't spell it out), so this is a manual list rather than a name match.</p>
+      <p class="subtitle">SKUs or barcodes explicitly marked below are never shipped to EAST, regardless of demand, HQ stock, or any other setting — not every product whose name mentions 김치 is actually one (and some genuine 김치 products don't spell it out), so this is a manual list rather than a name match.</p>
       <table>
         <tr><td>Enable 김치 override</td>
             <td><input type="checkbox" id="kimchi_override_enabled" ${s.kimchiEnabled ? "checked" : ""}></td></tr>
-        <tr><td>김치 EAST minimum floor</td>
-            <td><input type="number" id="kimchi_floor_pct" step="1" min="0" max="99" value="${Math.round(s.kimchiFloorPct * 100)}"> %</td></tr>
-        <tr><td>김치 EAST cap (soft — rounding up to a box may exceed this, up to the hard cap below)</td>
-            <td><input type="number" id="kimchi_cap_pct" step="1" min="1" max="100" value="${Math.round(s.kimchiCapPct * 100)}"> %</td></tr>
-        <tr><td>김치 EAST hard cap (rounding up is only allowed below this; at or above it, rounds down instead unless that would breach the floor)</td>
-            <td><input type="number" id="kimchi_hard_cap_pct" step="1" min="1" max="100" value="${Math.round(s.kimchiHardCapPct * 100)}"> %</td></tr>
       </table>
-      <p class="subtitle" style="margin-top:1rem;">Mark a SKU or barcode as 김치 — saved immediately, independent of the "Save settings" button below:</p>
+      <p class="subtitle" style="margin-top:1rem;">Mark a SKU or barcode as 김치 (never shipped) — saved immediately, independent of the "Save settings" button below:</p>
       <div class="toolbar" style="margin-bottom:0.5rem;">
         <input type="text" id="kimchi-add-input" placeholder="SKU or barcode" style="width:14em;">
         <button type="button" class="btn small" id="kimchi-add-btn">Add</button>
@@ -2567,15 +2554,10 @@ async function renderSettings() {
     const noBoxMinEa = parseInt(document.getElementById("no_box_min_ea").value, 10);
     const noBoxHqMinDays = parseInt(document.getElementById("no_box_hq_min_days").value, 10);
     const kimchiEnabled = document.getElementById("kimchi_override_enabled").checked;
-    const kimchiFloorPct = parseFloat(document.getElementById("kimchi_floor_pct").value) / 100;
-    const kimchiCapPct = parseFloat(document.getElementById("kimchi_cap_pct").value) / 100;
-    const kimchiHardCapPct = parseFloat(document.getElementById("kimchi_hard_cap_pct").value) / 100;
     const grFewFloorPct = parseFloat(document.getElementById("gr_few_floor_pct").value) / 100;
     const grFewCapPct = parseFloat(document.getElementById("gr_few_cap_pct").value) / 100;
     const grFewHardCapPct = parseFloat(document.getElementById("gr_few_hard_cap_pct").value) / 100;
     const staleSaleDaysThreshold = parseInt(document.getElementById("stale_sale_days_threshold").value, 10);
-    const kimchiValid = kimchiFloorPct >= 0 && kimchiFloorPct < kimchiCapPct
-      && kimchiCapPct < kimchiHardCapPct && kimchiHardCapPct <= 1;
     const grFewValid = grFewFloorPct >= 0 && grFewFloorPct < grFewCapPct
       && grFewCapPct <= grFewHardCapPct && grFewHardCapPct <= 1;
 
@@ -2611,8 +2593,6 @@ async function renderSettings() {
       flash("error", "Invalid settings: Minimum HQ days for a loose pick must be 0 or more.");
     } else if (!(staleSaleDaysThreshold >= 1)) {
       flash("error", "Invalid settings: Stale sale threshold must be at least 1 day.");
-    } else if (!kimchiValid) {
-      flash("error", "Invalid 김치 settings: floor % must be less than cap %, which must be less than hard cap %, all <= 100.");
     } else if (!grFewValid) {
       flash("error", "Invalid GR_Few settings: floor % must be less than cap %, which must be <= hard cap %, all <= 100.");
     } else if (storageOverrideError) {
@@ -2621,7 +2601,7 @@ async function renderSettings() {
       try {
         await saveSettings({
           capPct, floorPct, targetDays, boxRoundPct, zeroBoxRoundPct, noBoxMinEa, noBoxHqMinDays, staleSaleDaysThreshold,
-          kimchiEnabled, kimchiFloorPct, kimchiCapPct, kimchiHardCapPct,
+          kimchiEnabled,
           grFewFloorPct, grFewCapPct, grFewHardCapPct,
           storageOverrides,
         });
