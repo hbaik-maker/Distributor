@@ -144,7 +144,11 @@ function buildBoxheroRow(legacy, item) {
     Category: (item && item.category_name) || "",
     "입수/박스": (item && num(item.units_per_case) > 0) ? item.units_per_case : num(legacy.units_per_case),
     "Status.Online": (legacy.sales_status_online || (item && item.status) || ""),
-    "온라인 중요도": (item && item.md_grade) || "",
+    // md_grade is a manually-curated override and isn't set for every item;
+    // sales_grade is the auto-computed fallback Tari's own UI shows when
+    // md_grade is blank (confirmed: SKU 3107049 has md_grade=null,
+    // sales_grade="B", and Tari's UI shows B for it).
+    "온라인 중요도": (item && (item.md_grade || item.sales_grade)) || "",
     "보관": STORAGE_CONDITION_KO[storageRaw] || "",
     "Qty(00_HQ_Online)": num(legacy.stock_hq_west_online),
     "Qty(10_LOCAL_TRANS_ONLINE)": num(legacy.stock_lc_west_online),
