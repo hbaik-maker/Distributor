@@ -675,110 +675,203 @@ function resolveCsPerPlt(csPerPlt, boxSize, cbmEa) {
   return BOXES_PER_PALLET;
 }
 
-async function computeRecommendations(boxheroRows, scmRows, settings) {
-  const s = Object.assign({}, DEFAULT_SETTINGS, settings || {});
-  const grFewSkus = await loadGrFewSkus();
-  const kimchiIdentifiers = await loadKimchiSkus();
-
+// Indexes scm_sales rows by SKU (last occurrence wins, same as pandas
+// keep="last") and finds the data's own sync timestamp, so "days since last
+// sale" is anchored to when the export was taken rather than wall-clock now
+// — stable no matter when the export is opened.
+function buildScmIndex(scmRows) {
   const scmBySku = new Map();
   let asOfDate = null;
   for (const row of scmRows) {
     const sku = str(row[SCM_COL_SKU]);
     if (!sku) continue;
-    scmBySku.set(sku, row); // last occurrence wins, same as pandas keep="last"
-    // Anchor "days since last sale" to the data's own sync timestamp rather
-    // than wall-clock now, so the diagnostic stays stable no matter when the
-    // export is opened.
+    scmBySku.set(sku, row);
     const refreshedAt = parseCellDate(row[SCM_COL_REFRESHED_AT]);
     if (refreshedAt && (!asOfDate || refreshedAt > asOfDate)) asOfDate = refreshedAt;
   }
+  return { scmBySku, asOfDate };
+}
+
+// Everything derivable from a single boxhero row + its matching scm_sales
+// row, independent of settings/registries — the shared core used by both
+// computeRecommendations (a fresh run) and computeSecondaryRecommendations
+// (topping up an existing run with newly-arrived stock). Keeping this in one
+// place means the two can never drift the way the Detailed export's
+// once-duplicated isKimchi/GR_Few logic did.
+function deriveCoreFields(row, scmBySku, asOfDate) {
+  const sku = str(row[COL_SKU]);
+  const hqQty = num(row[COL_HQ_ONLINE]) + num(row[COL_LOCAL_TRANS_ONLINE]) + num(row[COL_KPAC_ONLINE]);
+  const eastOnhand = num(row[COL_PA_ART]) + num(row[COL_PA_ONLINE]);
+  const pa1 = num(row[COL_PA_1_PRE]);
+  const pa2 = num(row[COL_PA_2_PRE]);
+  const pa1Air = num(row[COL_PA_1_AIR_PRE]);
+  const pa2Air = num(row[COL_PA_2_AIR_PRE]);
+  // A SKU is assumed to be genuinely in transit via only ONE of the 4
+  // staging areas (regular or air, PA_1 or PA_2) at a time — whichever is
+  // largest; nonzero values in the other 3 are stale leftover data BoxHero
+  // hasn't cleared yet, same assumption as the original 2-value (non-air)
+  // version of this calculation. Mirrors compute_recommendations in
+  // app/calc.py.
+  const preStorageValues = [pa1, pa2, pa1Air, pa2Air];
+  const inTransit = Math.max(...preStorageValues);
+  const inTransitIgnored = preStorageValues.reduce((a, b) => a + b, 0) - inTransit;
+  const totalUnits = hqQty + eastOnhand + inTransit;
+  const eastPosition = eastOnhand + inTransit;
+
+  const salesRow = scmBySku.get(sku);
+  let avg5 = 0, avg30 = 0, avg90 = 0, windowUsed = null, totalAvgDaily = 0, eastAvgDaily = 0, daysSinceLastSale = null;
+  if (salesRow) {
+    const lastSaleDate = parseCellDate(salesRow[SCM_COL_LAST_SALE_DATE]);
+    daysSinceLastSale = daysBetween(asOfDate, lastSaleDate);
+    avg5 = num(salesRow[SCM_COL_5D_AVG]);
+    avg30 = num(salesRow[SCM_COL_30D_AVG]);
+    avg90 = num(salesRow[SCM_COL_90D_AVG]);
+    const windows = { "5d": avg5, "30d": avg30, "90d": avg90 };
+    windowUsed = Object.keys(windows).reduce((a, b) => (windows[b] > windows[a] ? b : a));
+    totalAvgDaily = windows[windowUsed];
+    const eastQtyByWindow = {
+      "5d": num(salesRow[SCM_COL_5D_EAST]),
+      "30d": num(salesRow[SCM_COL_30D_EAST]),
+      "90d": num(salesRow[SCM_COL_90D_EAST]),
+    };
+    const westQtyByWindow = {
+      "5d": num(salesRow[SCM_COL_5D_WEST]),
+      "30d": num(salesRow[SCM_COL_30D_WEST]),
+      "90d": num(salesRow[SCM_COL_90D_WEST]),
+    };
+    // avg_daily_qty columns use an internal (selling-days) denominator we
+    // can't reproduce, so split the already-correct totalAvgDaily by
+    // EAST's real observed share of that window's raw units instead of
+    // dividing east_qty by a fixed calendar window.
+    const eastQ = eastQtyByWindow[windowUsed];
+    const westQ = westQtyByWindow[windowUsed];
+    const eastShare = (eastQ + westQ) > 0 ? eastQ / (eastQ + westQ) : 0.5;
+    eastAvgDaily = totalAvgDaily * eastShare;
+  }
+
+  const boxSizeVal = num(row[COL_BOX_SIZE]);
+  const boxSize = boxSizeVal > 0 ? boxSizeVal : null;
+  const costVal = num(row[COL_COST]);
+  const cost = costVal > 0 ? costVal : null;
+  const cbmEa = resolveCbmEa(row, boxSize);
+  const csPerPltVal = num(row[COL_CS_PER_PLT]);
+  const csPerPlt = resolveCsPerPlt(csPerPltVal > 0 ? csPerPltVal : null, boxSize, cbmEa);
+
+  const importanceRaw = str(row[COL_IMPORTANCE]);
+  const importance = importanceRaw === "" ? "UNKNOWN" : importanceRaw;
+  const storage = str(row[COL_STORAGE]);
+
+  return {
+    sku, barcode: str(row[COL_BARCODE]), name: str(row[COL_NAME]),
+    englishName: str(row[COL_ENGLISH_NAME]), category: str(row[COL_CATEGORY]),
+    statusOnline: str(row[COL_STATUS_ONLINE]), importance, storage,
+    hqOnline: num(row[COL_HQ_ONLINE]), localTransOnline: num(row[COL_LOCAL_TRANS_ONLINE]),
+    kpacOnline: num(row[COL_KPAC_ONLINE]), hqQty,
+    paArt: num(row[COL_PA_ART]), paOnline: num(row[COL_PA_ONLINE]), eastOnhand,
+    pa1Pre: pa1, pa2Pre: pa2, pa1AirPre: pa1Air, pa2AirPre: pa2Air, inTransit, inTransitIgnored,
+    totalUnits, eastPosition,
+    avg5, avg30, avg90, windowUsed, totalAvgDaily, eastAvgDaily, daysSinceLastSale,
+    boxSize, cost, csPerPlt, cbmEa,
+  };
+}
+
+async function computeRecommendations(boxheroRows, scmRows, settings) {
+  const s = Object.assign({}, DEFAULT_SETTINGS, settings || {});
+  const grFewSkus = await loadGrFewSkus();
+  const kimchiIdentifiers = await loadKimchiSkus();
+  const { scmBySku, asOfDate } = buildScmIndex(scmRows);
 
   const results = [];
   for (const row of boxheroRows) {
     const sku = str(row[COL_SKU]);
     if (!sku) continue;
 
-    const hqQty = num(row[COL_HQ_ONLINE]) + num(row[COL_LOCAL_TRANS_ONLINE]) + num(row[COL_KPAC_ONLINE]);
-    const eastOnhand = num(row[COL_PA_ART]) + num(row[COL_PA_ONLINE]);
-    const pa1 = num(row[COL_PA_1_PRE]);
-    const pa2 = num(row[COL_PA_2_PRE]);
-    const pa1Air = num(row[COL_PA_1_AIR_PRE]);
-    const pa2Air = num(row[COL_PA_2_AIR_PRE]);
-    // A SKU is assumed to be genuinely in transit via only ONE of the 4
-    // staging areas (regular or air, PA_1 or PA_2) at a time — whichever is
-    // largest; nonzero values in the other 3 are stale leftover data BoxHero
-    // hasn't cleared yet, same assumption as the original 2-value (non-air)
-    // version of this calculation. Mirrors compute_recommendations in
-    // app/calc.py.
-    const preStorageValues = [pa1, pa2, pa1Air, pa2Air];
-    const inTransit = Math.max(...preStorageValues);
-    const inTransitIgnored = preStorageValues.reduce((a, b) => a + b, 0) - inTransit;
-    const totalUnits = hqQty + eastOnhand + inTransit;
-    const eastPosition = eastOnhand + inTransit;
-
-    const salesRow = scmBySku.get(sku);
-    let avg5 = 0, avg30 = 0, avg90 = 0, windowUsed = null, totalAvgDaily = 0, eastAvgDaily = 0, daysSinceLastSale = null;
-    if (salesRow) {
-      const lastSaleDate = parseCellDate(salesRow[SCM_COL_LAST_SALE_DATE]);
-      daysSinceLastSale = daysBetween(asOfDate, lastSaleDate);
-      avg5 = num(salesRow[SCM_COL_5D_AVG]);
-      avg30 = num(salesRow[SCM_COL_30D_AVG]);
-      avg90 = num(salesRow[SCM_COL_90D_AVG]);
-      const windows = { "5d": avg5, "30d": avg30, "90d": avg90 };
-      windowUsed = Object.keys(windows).reduce((a, b) => (windows[b] > windows[a] ? b : a));
-      totalAvgDaily = windows[windowUsed];
-      const eastQtyByWindow = {
-        "5d": num(salesRow[SCM_COL_5D_EAST]),
-        "30d": num(salesRow[SCM_COL_30D_EAST]),
-        "90d": num(salesRow[SCM_COL_90D_EAST]),
-      };
-      const westQtyByWindow = {
-        "5d": num(salesRow[SCM_COL_5D_WEST]),
-        "30d": num(salesRow[SCM_COL_30D_WEST]),
-        "90d": num(salesRow[SCM_COL_90D_WEST]),
-      };
-      // avg_daily_qty columns use an internal (selling-days) denominator we
-      // can't reproduce, so split the already-correct totalAvgDaily by
-      // EAST's real observed share of that window's raw units instead of
-      // dividing east_qty by a fixed calendar window.
-      const eastQ = eastQtyByWindow[windowUsed];
-      const westQ = westQtyByWindow[windowUsed];
-      const eastShare = (eastQ + westQ) > 0 ? eastQ / (eastQ + westQ) : 0.5;
-      eastAvgDaily = totalAvgDaily * eastShare;
-    }
-
-    const boxSizeVal = num(row[COL_BOX_SIZE]);
-    const boxSize = boxSizeVal > 0 ? boxSizeVal : null;
-    const costVal = num(row[COL_COST]);
-    const cost = costVal > 0 ? costVal : null;
-    const cbmEa = resolveCbmEa(row, boxSize);
-    const csPerPltVal = num(row[COL_CS_PER_PLT]);
-    const csPerPlt = resolveCsPerPlt(csPerPltVal > 0 ? csPerPltVal : null, boxSize, cbmEa);
-
-    const importanceRaw = str(row[COL_IMPORTANCE]);
-    const importance = importanceRaw === "" ? "UNKNOWN" : importanceRaw;
-    const storage = str(row[COL_STORAGE]);
-
-    const item = {
-      sku, barcode: str(row[COL_BARCODE]), name: str(row[COL_NAME]),
-      englishName: str(row[COL_ENGLISH_NAME]), category: str(row[COL_CATEGORY]),
-      statusOnline: str(row[COL_STATUS_ONLINE]), importance, storage,
-      hqOnline: num(row[COL_HQ_ONLINE]), localTransOnline: num(row[COL_LOCAL_TRANS_ONLINE]),
-      kpacOnline: num(row[COL_KPAC_ONLINE]), hqQty,
-      paArt: num(row[COL_PA_ART]), paOnline: num(row[COL_PA_ONLINE]), eastOnhand,
-      pa1Pre: pa1, pa2Pre: pa2, pa1AirPre: pa1Air, pa2AirPre: pa2Air, inTransit, inTransitIgnored,
-      totalUnits, eastPosition,
-      avg5, avg30, avg90, windowUsed, totalAvgDaily, eastAvgDaily, daysSinceLastSale,
-      boxSize, cost, csPerPlt, cbmEa, finalQtyUser: null,
+    const core = deriveCoreFields(row, scmBySku, asOfDate);
+    const item = Object.assign({}, core, {
+      finalQtyUser: null,
       grFew: grFewSkus.has(sku),
-      isKimchi: kimchiIdentifiers.has(sku) || kimchiIdentifiers.has(str(row[COL_BARCODE])),
-    };
+      isKimchi: kimchiIdentifiers.has(sku) || kimchiIdentifiers.has(core.barcode),
+    });
     const shipment = computeShipment(item, s);
     Object.assign(item, shipment);
     item.included = shipment.includedDefault;
     results.push(item);
   }
   return results;
+}
+
+/* Secondary top-up run: after a base run ships, local-supplier stock that
+   arrives the same day may free up room to send a bit more before the next
+   full planning cycle. Deliberately narrower than a normal run:
+   - Only SKUs the base run already considered, and only if something for
+     that SKU actually moved 00_HQ_INBOUND -> 00_HQ_Online that day (see
+     fetchReceivedQuantities) — inventory that was already sitting at HQ
+     before the base run isn't reconsidered here, that was its call to make.
+   - No floor_pct — this is purely "does EAST still fall short of the base
+     run's own target_days, now that time has passed and fresh sales data is
+     in," not a safety-stock top-up.
+   - Rounds DOWN only (never completes a box) and never ships more than what
+     actually arrived — "ship as little as gets the job done," not "ship as
+     much as fits."
+   - A hard 0.5-pallet-per-storage-type ceiling (not a target to fill, unlike
+     shapeToPalletCap) — SKUs that don't fit are dropped, not partially
+     filled to reach it.
+   김치-marked SKUs are excluded outright, same standing override as always. */
+async function computeSecondaryRecommendations(parentItems, boxheroRows, scmRows, receivedBySku, parentSettings) {
+  const { scmBySku, asOfDate } = buildScmIndex(scmRows);
+  const boxheroBySku = new Map();
+  for (const row of boxheroRows) {
+    const sku = str(row[COL_SKU]);
+    if (sku) boxheroBySku.set(sku, row);
+  }
+
+  const candidates = [];
+  for (const parentItem of parentItems) {
+    if (parentItem.isKimchi) continue;
+    const received = num(receivedBySku[parentItem.sku]);
+    if (received <= 0) continue;
+
+    const row = boxheroBySku.get(parentItem.sku);
+    if (!row) continue; // no longer in the live feed -- nothing fresh to compute against
+    const core = deriveCoreFields(row, scmBySku, asOfDate);
+    if (!core.boxSize) continue; // can't measure this in boxes for the pallet ceiling below
+
+    const rowSettings = effectiveSettingsForStorage(parentSettings, core.storage);
+    const shortfall = Math.max(0, rowSettings.targetDays * core.eastAvgDaily - core.eastPosition);
+    if (shortfall <= 0) continue; // EAST already covers the base run's own target -- don't send more
+
+    const capPct = parentItem.grFew ? rowSettings.grFewCapPct : rowSettings.capPct;
+    const capRoom = Math.max(0, capPct * core.totalUnits - core.eastPosition);
+
+    const rawQty = Math.min(shortfall, received, capRoom, core.hqQty);
+    const finalQty = Math.floor(rawQty / core.boxSize) * core.boxSize; // round DOWN only
+    if (finalQty <= 0) continue;
+
+    candidates.push(Object.assign({}, core, {
+      finalQtyUser: null,
+      grFew: parentItem.grFew,
+      isKimchi: false,
+      finalQtyComputed: finalQty,
+      flags: ["SECONDARY_TOP_UP"],
+      included: true,
+    }));
+  }
+
+  // Hard per-storage-type ceiling, same priority order as shapeToPalletCap —
+  // a cap, not a target: SKUs that don't fit are dropped, nothing is topped
+  // up to fill the remaining room.
+  candidates.sort(compareShipPriority);
+  const CEILING_BOXES = 0.5 * BOXES_PER_PALLET;
+  const runningByStorage = new Map();
+  const kept = [];
+  for (const it of candidates) {
+    const running = runningByStorage.get(it.storage) || 0;
+    const boxes = it.finalQtyComputed / it.boxSize;
+    if (running + boxes > CEILING_BOXES + 1e-9) continue;
+    runningByStorage.set(it.storage, running + boxes);
+    kept.push(it);
+  }
+  return kept;
 }
 
 function effectiveQty(item) {
@@ -934,10 +1027,10 @@ async function getRunItems(runId) {
   }
 }
 
-async function createRun(sourceFilename, settings, items) {
+async function createRun(sourceFilename, settings, items, parentRunId) {
   const data = await apiFetch("/runs", {
     method: "POST",
-    body: JSON.stringify({ sourceFilename, settings, items }),
+    body: JSON.stringify({ sourceFilename, settings, items, parentRunId: parentRunId || null }),
   });
   return data.id;
 }
@@ -947,6 +1040,15 @@ async function createRun(sourceFilename, settings, items) {
 // Excel upload used to produce, so computeRecommendations needs no changes.
 async function fetchTariDatasource() {
   return apiFetch("/runs?action=tari-datasource");
+}
+
+// Per-SKU quantity moved 00_HQ_INBOUND -> 00_HQ_Online (server-side proxy —
+// see sumMovedQuantitiesBetween in api/_lib/boxhero.js) on the Pacific
+// calendar day `parentRunId` was created — the input a secondary run's
+// top-up calculation needs.
+async function fetchReceivedQuantities(parentRunId) {
+  const data = await apiFetch(`/runs?action=received-quantities&parentRunId=${parentRunId}`);
+  return data.receivedBySku;
 }
 
 async function updateRunItems(runId, items) {
@@ -1323,7 +1425,7 @@ async function renderUpload() {
 
   const rowsHtml = (list, actionLabel, actionHref) => list.map((r) => `
     <tr>
-      <td>#${r.id}</td>
+      <td>#${r.id}${r.parentRunId ? ` <span class="badge badge-info">secondary of #${r.parentRunId}</span>` : ""}</td>
       <td>${fmtDate(r.status === "finalized" ? r.finalizedAt : r.createdAt)}</td>
       <td>${esc(r.sourceFilename)}</td>
       <td>${r.itemCount}</td>
@@ -1493,7 +1595,7 @@ async function renderRunDetail(runId) {
     flaggedSkus: items.filter((it) => it.flags && it.flags.length).length,
   };
   app.innerHTML = layout(`
-    <h1>Run #${meta.id} <span class="badge ${meta.status === "finalized" ? "badge-info" : "badge-warn"}">${meta.status}</span></h1>
+    <h1>Run #${meta.id} <span class="badge ${meta.status === "finalized" ? "badge-info" : "badge-warn"}">${meta.status}</span>${meta.parentRunId ? ` <span class="badge badge-info">secondary of #${meta.parentRunId}</span>` : ""}</h1>
     <p class="subtitle">
       Source: ${esc(meta.sourceFilename)} · Uploaded ${fmtDate(meta.createdAt)}
       ${meta.finalizedAt ? ` · Finalized ${fmtDate(meta.finalizedAt)}` : ""}
@@ -1511,6 +1613,12 @@ async function renderRunDetail(runId) {
       <button class="btn secondary" id="export-detailed-btn">Download Detailed Excel</button>
       <button class="btn secondary" id="export-picker-list-btn">Download Picker List</button>
     </div>
+    ${meta.status === "finalized" && !meta.parentRunId ? `
+    <div class="card">
+      <h2 style="margin-top:0;">Secondary run</h2>
+      <p class="muted">Checks stock received (00_HQ_INBOUND → 00_HQ_Online) on the day this run was created against each SKU's current EAST coverage, and suggests a small top-up (max 0.5 pallet per storage type) for anything still short. Run this once receiving is done for the day — same result whether that's this evening or tomorrow morning.</p>
+      <button class="btn" id="create-secondary-btn">Check for secondary shipment</button>
+    </div>` : ""}
     ${shipmentCardHtml(meta, shipment)}
     ${meta.status === "pending" ? `<div class="card"><p>This run has not been finalized yet.</p><a class="btn" href="#/runs/${meta.id}/review">Continue review</a></div>` : ""}
   `);
@@ -1520,6 +1628,36 @@ async function renderRunDetail(runId) {
   if (simpleBtn) simpleBtn.addEventListener("click", () => exportSimple(meta, items));
   if (detailedBtn) detailedBtn.addEventListener("click", () => exportDetailed(meta, items));
   if (pickerListBtn) pickerListBtn.addEventListener("click", () => exportPickerList(meta, items));
+
+  const secondaryBtn = document.getElementById("create-secondary-btn");
+  if (secondaryBtn) {
+    secondaryBtn.addEventListener("click", async () => {
+      secondaryBtn.disabled = true;
+      secondaryBtn.textContent = "Checking…";
+      try {
+        const [datasource, receivedBySku] = await Promise.all([
+          fetchTariDatasource(),
+          fetchReceivedQuantities(meta.id),
+        ]);
+        const secondaryItems = await computeSecondaryRecommendations(
+          items, datasource.boxhero, datasource.scm, receivedBySku, meta.settings
+        );
+        if (!secondaryItems.length) {
+          flash("success", "Nothing to send — no SKU both received new stock and still falls short of its target coverage.");
+          secondaryBtn.disabled = false;
+          secondaryBtn.textContent = "Check for secondary shipment";
+          return;
+        }
+        const newRunId = await createRun(`${meta.sourceFilename} (secondary)`, meta.settings, secondaryItems, meta.id);
+        flash("success", `Secondary run #${newRunId} created with ${secondaryItems.length} SKU(s).`);
+        location.hash = `#/runs/${newRunId}/review`;
+      } catch (e) {
+        flash("error", `Could not check for secondary shipment: ${e.message}`);
+        secondaryBtn.disabled = false;
+        secondaryBtn.textContent = "Check for secondary shipment";
+      }
+    });
+  }
 
   const planBtn = document.getElementById("plan-shipment-btn");
   if (planBtn) {
@@ -1771,10 +1909,10 @@ async function renderReview(runId) {
         data-search="${esc((it.sku + " " + it.barcode + " " + it.name).toLowerCase())}">
       <td data-col="importance"><span class="badge badge-info">${esc(it.importance)}</span></td>
       <td data-col="send"><input type="checkbox" data-role="included" data-sku="${esc(it.sku)}" ${it.included ? "checked" : ""}></td>
-      <td data-col="grFew"><input type="checkbox" class="grfew-checkbox" data-role="grfew" data-sku="${esc(it.sku)}" ${it.grFew ? "checked" : ""}
-             title="Allocate only ${Math.round(meta.settings.grFewFloorPct * 100)}%-${Math.round(meta.settings.grFewCapPct * 100)}% to the East. Shipping directly from the West is cheaper than the combined LTL transfer and East outbound costs."></td>
-      <td data-col="kimchi"><input type="checkbox" class="kimchi-checkbox" data-role="kimchi" data-sku="${esc(it.sku)}" data-barcode="${esc(it.barcode)}" ${it.isKimchi ? "checked" : ""}
-             title="Manually marked 김치 — never shipped to EAST, regardless of demand or HQ stock."></td>
+      <td data-col="grFew"><input type="checkbox" class="grfew-checkbox" data-role="grfew" data-sku="${esc(it.sku)}" ${it.grFew ? "checked" : ""} ${meta.parentRunId ? "disabled" : ""}
+             title="Allocate only ${Math.round(meta.settings.grFewFloorPct * 100)}%-${Math.round(meta.settings.grFewCapPct * 100)}% to the East. Shipping directly from the West is cheaper than the combined LTL transfer and East outbound costs.${meta.parentRunId ? " (fixed for a secondary run)" : ""}"></td>
+      <td data-col="kimchi"><input type="checkbox" class="kimchi-checkbox" data-role="kimchi" data-sku="${esc(it.sku)}" data-barcode="${esc(it.barcode)}" ${it.isKimchi ? "checked" : ""} ${meta.parentRunId ? "disabled" : ""}
+             title="Manually marked 김치 — never shipped to EAST, regardless of demand or HQ stock.${meta.parentRunId ? " (fixed for a secondary run)" : ""}"></td>
       <td data-col="name" class="truncate-cell" title="${esc(it.name)}">${esc(it.name)}<div class="name-sub">${esc(it.sku)} · ${esc(it.barcode)}</div></td>
       <td data-col="hqQty">${round0(it.hqQty)}</td>
       <td data-col="eastPosition">${round0(it.eastPosition)}</td>
@@ -1789,11 +1927,16 @@ async function renderReview(runId) {
     </tr>`;
   }).join("");
 
-  app.innerHTML = layout(`
-    <h1>Review Run #${meta.id}</h1>
-    <p class="subtitle">
-      Source: ${esc(meta.sourceFilename)} · Uploaded ${fmtDate(meta.createdAt)} · ${items.length} SKUs
-    </p>
+  // A secondary run's quantities were computed server-side from newly-arrived
+  // stock, a fixed short-list of SKUs, and a hard per-storage pallet ceiling
+  // — none of that logic is what these sliders would recompute with (they'd
+  // silently fall back to a normal run's floor/cap/box-rounding math), so
+  // they're hidden rather than left to produce a misleading recalculation.
+  const liveSettingsHtml = meta.parentRunId ? `
+    <div class="toolbar settings-inline">
+      <strong>Secondary run of Run #${meta.parentRunId}:</strong>
+      <span class="muted">Quantities here are a one-time top-up computed from stock received since Run #${meta.parentRunId}, capped at 0.5 pallet per storage type. Live settings sliders don't apply — edit Ship qty directly per row if needed.</span>
+    </div>` : `
     <div class="toolbar settings-inline">
       <strong>Settings (this run only):</strong>
       <label>EAST cap <input type="number" id="set-cap-pct" class="qty-input" min="1" max="100" step="1" value="${Math.round(meta.settings.capPct * 100)}"> %</label>
@@ -1840,7 +1983,14 @@ async function renderReview(runId) {
         </span>`;
       }).join("")}
       <span class="muted">Blank = inherit the shared setting above for that storage type.</span>
-    </div>
+    </div>`;
+
+  app.innerHTML = layout(`
+    <h1>Review Run #${meta.id}${meta.parentRunId ? ` <span class="badge badge-info">secondary of #${meta.parentRunId}</span>` : ""}</h1>
+    <p class="subtitle">
+      Source: ${esc(meta.sourceFilename)} · Uploaded ${fmtDate(meta.createdAt)} · ${items.length} SKUs
+    </p>
+    ${liveSettingsHtml}
     <div class="toolbar">
       <div class="storage-toggle" id="storage-toggle">
         <button type="button" class="storage-btn active" data-storage="ALL">All</button>
@@ -1866,6 +2016,7 @@ async function renderReview(runId) {
         <option value="GR_FEW_OVERRIDE">GR_Few override</option>
         <option value="POSSIBLY_DISCONTINUED">Possibly discontinued</option>
         <option value="SMALL_QTY_SKIPPED">Small qty skipped (less than a box)</option>
+        <option value="SECONDARY_TOP_UP">Secondary top-up</option>
       </select>
       <select id="included-filter"><option value="">Included + excluded</option><option value="yes">Included only</option><option value="no">Excluded only</option></select>
       <div class="spacer"></div>
@@ -1903,7 +2054,7 @@ async function renderReview(runId) {
   wireReviewFilters(bySku);
   wireLiveCalc(bySku);
   wirePalletCapControls(bySku, meta);
-  wireLiveSettings(bySku, meta, runId);
+  if (!meta.parentRunId) wireLiveSettings(bySku, meta, runId);
   recomputeTotalPallets(bySku);
   document.getElementById("save-progress-btn").addEventListener("click", () => commitReview(runId, items, false));
   document.getElementById("finalize-btn").addEventListener("click", () => {
@@ -2287,6 +2438,21 @@ function wireLiveSettings(bySku, meta, runId) {
  * exactly at the target. Always starts from each SKU's suggested quantity,
  * not whatever is currently in the box, so re-applying with different
  * targets is predictable rather than compounding. */
+// GR_Few SKUs are deliberately minimized to EAST already (cheaper to ship
+// direct from West) — they rank below even UNKNOWN-grade (rank 6) items, so
+// they're the first cut when trimming to fit and the last topped up when
+// filling toward a target. Shared by shapeToPalletCap and
+// computeSecondaryRecommendations so both cut/fill in the same order.
+function shipPriorityKey(it) {
+  const eastDaysBefore = it.eastAvgDaily > 0 ? it.eastPosition / it.eastAvgDaily : Infinity;
+  const rank = it.grFew ? 7 : (IMPORTANCE_RANK[it.importance] ?? 6);
+  return [rank, eastDaysBefore];
+}
+function compareShipPriority(a, b) {
+  const pa = shipPriorityKey(a), pb = shipPriorityKey(b);
+  return (pa[0] - pb[0]) || (pa[1] - pb[1]);
+}
+
 function shapeToPalletCap(storageType, targetPallets, bySku, targetDays) {
   const targetBoxes = targetPallets * BOXES_PER_PALLET;
   const overageBoxes = 0.5 * BOXES_PER_PALLET;
@@ -2296,16 +2462,9 @@ function shapeToPalletCap(storageType, targetPallets, bySku, targetDays) {
 
   const withPriority = rows.map((row) => {
     const sku = row.querySelector('input[data-role="included"]').dataset.sku;
-    const it = bySku.get(sku);
-    const eastDaysBefore = it.eastAvgDaily > 0 ? it.eastPosition / it.eastAvgDaily : Infinity;
-    // GR_Few SKUs are deliberately minimized to EAST already (cheaper to
-    // ship direct from West) — they should be the first cut when trimming
-    // to fit, and the last topped up when filling toward the target, below
-    // even UNKNOWN-grade (rank 6) items.
-    const rank = it.grFew ? 7 : (IMPORTANCE_RANK[it.importance] ?? 6);
-    return { row, it, priority: [rank, eastDaysBefore] };
+    return { row, it: bySku.get(sku) };
   });
-  withPriority.sort((a, b) => (a.priority[0] - b.priority[0]) || (a.priority[1] - b.priority[1]));
+  withPriority.sort((a, b) => compareShipPriority(a.it, b.it));
 
   // Pass 1: same priority-order fill as before, except the boundary that
   // trims a SKU's own suggested quantity is now the ceiling (target + 0.5

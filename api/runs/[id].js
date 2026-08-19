@@ -10,6 +10,7 @@ function rowToMeta(row) {
     status: row.status,
     finalizedAt: row.finalized_at,
     settings: row.settings_json,
+    parentRunId: row.parent_run_id,
   };
 }
 

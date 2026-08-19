@@ -140,6 +140,47 @@ async function resolveLocationIdByName(name) {
   return match;
 }
 
+// GET /v1/transactions only filters by `type` (in/out/move/adjust) -- no
+// date or location filter, and no per-item detail (confirmed against
+// BoxHero's live /docs/spec: list items use the SimpleLocationTransaction*
+// shapes, item lines only come back from GET /v1/transactions/{tx_id}).
+// Ordered by id descending (newest first) per BoxHero's own docs.
+async function listTransactionsPage({ type, cursor, limit } = {}) {
+  const params = new URLSearchParams();
+  if (type) params.set("type", type);
+  if (cursor !== undefined && cursor !== null) params.set("cursor", cursor);
+  if (limit) params.set("limit", limit);
+  const qs = params.toString();
+  return boxheroFetch(`/v1/transactions${qs ? `?${qs}` : ""}`);
+}
+
+// Sums per-SKU quantity for every `move` transaction from `fromLocationName`
+// to `toLocationName` whose transaction_time falls in [sinceIso, untilIso).
+// Pages backward from newest until transaction_time drops below sinceIso
+// (safe because /v1/transactions is newest-first), then fetches full item
+// detail only for the transactions that actually match the location pair --
+// avoids a detail call per irrelevant move (e.g. EAST-side transfers).
+async function sumMovedQuantitiesBetween({ fromLocationName, toLocationName, sinceIso, untilIso }) {
+  const totals = new Map();
+  let cursor;
+  for (;;) {
+    const page = await listTransactionsPage({ type: "move", cursor, limit: 100 });
+    let hitFloor = false;
+    for (const tx of page.items) {
+      if (tx.transaction_time < sinceIso) { hitFloor = true; break; }
+      if (tx.transaction_time >= untilIso) continue;
+      if (tx.from_location.name !== fromLocationName || tx.to_location.name !== toLocationName) continue;
+      const detail = await getTransactionDetail(tx.id);
+      for (const line of detail.items) {
+        totals.set(line.sku, (totals.get(line.sku) || 0) + line.quantity);
+      }
+    }
+    if (hitFloor || !page.has_more) break;
+    cursor = page.cursor;
+  }
+  return totals;
+}
+
 // items: [{ sku, quantity }] — up to 500 per call per BoxHero's spec; callers
 // with more lines than that must chunk (see execute route).
 async function createMoveTransaction({ fromLocationId, toLocationId, items, memo }) {
@@ -199,4 +240,5 @@ module.exports = {
   getTransactionDetail,
   updateMoveTransaction,
   deleteTransaction,
+  sumMovedQuantitiesBetween,
 };
